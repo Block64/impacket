@@ -406,7 +406,13 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser(add_help = True, description = "PSEXEC like functionality example using RemComSvc.")
 
-    parser.add_argument('target', action='store', help='[[domain/]username[:password]@]<targetName or address>')
+    # parser.add_argument('target', action='store', help='[[domain/]username[:password]@]<targetName or address>')
+    parser.add_argument('-d', action='store', help='[domain]')
+    parser.add_argument('-u', action='store', help='[username]')
+    parser.add_argument('-p', action='store', help='[password]')
+    parser.add_argument('-ip', action='store', help='[ip address]')
+    parser.add_argument('-t', action='store', help='[protocol port]')
+    parser.add_argument('-f', action='store', help='[file containg list of IP addresses]')
     parser.add_argument('command', nargs='*', default = ' ', help='command (or arguments if -c is used) to execute at the target (w/o path) - (default:cmd.exe)')
     parser.add_argument('-c', action='store',metavar = "pathname",  help='copy the filename for later execution, arguments are passed in the command option')
     parser.add_argument('-path', action='store', help='path of the command to execute')
@@ -429,24 +435,59 @@ if __name__ == '__main__':
     if options.debug is True:
         logging.getLogger().setLevel(logging.DEBUG)
     else:
-        logging.getLogger().setLevel(logging.INFO)
+        logging.getLogger().setLevel(logging.ERROR)
 
-    import re
-    domain, username, password, address = re.compile('(?:(?:([^/@:]*)/)?([^@:]*)(?::([^@]*))?@)?(.*)').match(options.target).groups('')
+    # import re
+    # domain, username, password, address = re.compile('(?:(?:([^/@:]*)/)?([^@:]*)(?::([^@]*))?@)?(.*)').match(options.target).groups('')
 
-    if domain is None:
-        domain = ''
+    # if domain is None:
+    #     domain = ''
 
-    if password == '' and username != '' and options.hashes is None and options.no_pass is False and options.aesKey is None:
-        from getpass import getpass
-        password = getpass("Password:")
+    # if password == '' and username != '' and options.hashes is None and options.no_pass is False and options.aesKey is None:
+    #     from getpass import getpass
+    #     password = getpass("Password:")
 
     if options.aesKey is not None:
         options.k = True
 
+    if options.t is None:
+        protocol = None
+    else:
+        protocol = options.t + '/SMB'
+    
+    if options.f:
+        inp = open (options.f,"r")
+        for line in inp.readlines():
+            addList.append(line)
+        for address in addList:
+            username = options.u
+            password = options.p
+            if options.d is None:
+                domain = ''
+            else:
+                domain = options.d
+            if password == '' and username != '' and options.hashes is None:
+                from getpass import getpass
+                password = getpass("Password:")
+
+
+
+                executer = PSEXEC(' '.join(options.command), options.path, options.file, options.c, protocol, username, password, domain, options.hashes, options.aesKey, options.k)
+                executer.run(address)
+    else:
+        if options.d is None:
+            domain = ''
+        else:
+            domain = options.d
+            if options.p == '' and options.u != '' and options.hashes is None:
+                from getpass import getpass
+                password = getpass("Password:")
     command = ' '.join(options.command)
     if command == ' ':
         command = 'cmd.exe'
 
-    executer = PSEXEC(command, options.path, options.file, options.c, None, username, password, domain, options.hashes, options.aesKey, options.k)
-    executer.run(address)
+    # executer = PSEXEC(command, options.path, options.file, options.c, None, username, password, domain, options.hashes, options.aesKey, options.k)
+    # executer.run(address)
+    executer = PSEXEC(command, options.path, options.file, options.c, protocol, options.u, options.p, domain, options.hashes, options.aesKey, options.k)
+    executer.run(options.ip)
+
