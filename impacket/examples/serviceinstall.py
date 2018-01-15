@@ -5,8 +5,8 @@
 # for more information.
 #
 # Service Install Helper library used by psexec and smbrelayx
-# You provide an already established connection and an exefile 
-# (or class that mimics a file class) and this will install and 
+# You provide an already established connection and an exefile
+# (or class that mimics a file class) and this will install and
 # execute the service, and then uninstall (install(), uninstall().
 # It tries to take care as much as possible to leave everything clean.
 #
@@ -25,8 +25,8 @@ from impacket.smb3structs import FILE_WRITE_DATA, FILE_DIRECTORY_FILE
 class ServiceInstall:
     def __init__(self, SMBObject, exeFile, serviceName=''):
         self._rpctransport = 0
-        self.__service_name = serviceName if len(serviceName) > 0  else  ''.join([random.choice(string.letters) for i in range(4)])
-        self.__binary_service_name = ''.join([random.choice(string.letters) for i in range(8)]) + '.exe'
+        self.__service_name = serviceName if len(serviceName) > 0  else  'BlockboxSVC'
+        self.__binary_service_name = 'BlockboxExec.exe'
         self.__exeFile = exeFile
 
         # We might receive two different types of objects, always end up
@@ -37,14 +37,14 @@ class ServiceInstall:
             self.connection = SMBObject
 
         self.share = ''
- 
+
     def getShare(self):
         return self.share
 
     def getShares(self):
         # Setup up a DCE SMBTransport with the connection already in place
         LOG.info("Requesting shares on %s....." % (self.connection.getRemoteHost()))
-        try: 
+        try:
             self._rpctransport = transport.SMBTransport(self.connection.getRemoteHost(),
                                                         self.connection.getRemoteHost(),filename = r'\srvsvc',
                                                         smb_connection = self.connection)
@@ -58,7 +58,7 @@ class ServiceInstall:
             LOG.critical("Error requesting shares on %s, aborting....." % (self.connection.getRemoteHost()))
             raise
 
-        
+
     def createService(self, handle, share, path):
         LOG.info("Creating service %s on %s....." % (self.__service_name, self.connection.getRemoteHost()))
 
@@ -78,7 +78,7 @@ class ServiceInstall:
 
         # Create the service
         command = '%s\\%s' % (path, self.__binary_service_name)
-        try: 
+        try:
             resp = scmr.hRCreateServiceW(self.rpcsvc, handle,self.__service_name + '\x00', self.__service_name + '\x00',
                                          lpBinaryPathName=command + '\x00', dwStartType=scmr.SERVICE_DEMAND_START)
         except:
@@ -168,7 +168,7 @@ class ServiceInstall:
                         if serverName != '':
                            path = '\\\\%s\\%s' % (serverName, self.share)
                         else:
-                           path = '\\\\127.0.0.1\\' + self.share 
+                           path = '\\\\127.0.0.1\\' + self.share
                     service = self.createService(svcManager, self.share, path)
                     serviceCreated = True
                     if service != 0:
@@ -176,29 +176,29 @@ class ServiceInstall:
                         LOG.info('Starting service %s.....' % self.__service_name)
                         try:
                             scmr.hRStartServiceW(self.rpcsvc, service)
-                        except:
-                            pass
+                        except Exception, e:
+                            LOG.critical("Could not start service: %s" % e)
                         scmr.hRCloseServiceHandle(self.rpcsvc, service)
                     scmr.hRCloseServiceHandle(self.rpcsvc, svcManager)
                     return True
             except Exception, e:
-                LOG.critical("Error performing the installation, cleaning up: %s" %e)
+                LOG.critical("Error performing the installation, cleaning up: %s" % e)
                 try:
                     scmr.hRControlService(self.rpcsvc, service, scmr.SERVICE_CONTROL_STOP)
-                except:
-                    pass
+                except Exception, e:
+                    LOG.critical("Could not stop service: %s" % e)
                 if fileCopied is True:
                     try:
                         self.connection.deleteFile(self.share, self.__binary_service_name)
-                    except:
-                        pass
+                    except Exception, e:
+                        LOG.critical("Could not delete file: %s" % e)
                 if serviceCreated is True:
                     try:
                         scmr.hRDeleteService(self.rpcsvc, service)
-                    except:
-                        pass
+                    except Exception, e:
+                        LOG.critical("Could not delete service: %s" % e)
             return False
-      
+
     def uninstall(self):
         fileCopied = True
         serviceCreated = True
@@ -208,36 +208,35 @@ class ServiceInstall:
             svcManager = self.openSvcManager()
             if svcManager != 0:
                 resp = scmr.hROpenServiceW(self.rpcsvc, svcManager, self.__service_name+'\x00')
-                service = resp['lpServiceHandle'] 
+                service = resp['lpServiceHandle']
                 LOG.info('Stoping service %s.....' % self.__service_name)
                 try:
                     scmr.hRControlService(self.rpcsvc, service, scmr.SERVICE_CONTROL_STOP)
-                except:
-                    pass
+                except Exception, e:
+                    LOG.critical("Could not stop the service: %s" % e)
                 LOG.info('Removing service %s.....' % self.__service_name)
                 scmr.hRDeleteService(self.rpcsvc, service)
                 scmr.hRCloseServiceHandle(self.rpcsvc, service)
                 scmr.hRCloseServiceHandle(self.rpcsvc, svcManager)
             LOG.info('Removing file %s.....' % self.__binary_service_name)
             self.connection.deleteFile(self.share, self.__binary_service_name)
-        except Exception:
-            LOG.critical("Error performing the uninstallation, cleaning up" )
+        except Exception, e:
+            LOG.critical("Error performing the uninstallation, cleaning up. - %s" % e)
             try:
                 scmr.hRControlService(self.rpcsvc, service, scmr.SERVICE_CONTROL_STOP)
-            except:
-                pass
+            except Exception, e:
+                LOG.critical("Could not stop the service: %s" % e)
             if fileCopied is True:
                 try:
                     self.connection.deleteFile(self.share, self.__binary_service_name)
-                except:
+                except Exception, e:
+                    LOG.critical("Could not delete the file, reattempting: %s" % e)
                     try:
                         self.connection.deleteFile(self.share, self.__binary_service_name)
-                    except:
-                        pass
-                    pass
+                    except Exception, e:
+                        LOG.critical("Could not delete the file: %s" % e)
             if serviceCreated is True:
                 try:
                     scmr.hRDeleteService(self.rpcsvc, service)
-                except:
-                    pass
-
+                except Exception, e:
+                    LOG.critical("Could not delete the service: %s" % e)
