@@ -1,4 +1,4 @@
-# Copyright (c) 2003-2015 CORE Security Technologies
+# Copyright (c) 2003-2016 CORE Security Technologies
 #
 # This software is provided under under a slightly modified version
 # of the Apache Software License. See the accompanying LICENSE file
@@ -19,6 +19,8 @@ import struct
 import os
 
 from pyasn1.codec.der import decoder, encoder
+from pyasn1.error import PyAsn1Error
+from pyasn1.type.univ import noValue
 from binascii import unhexlify
 
 from impacket.krb5.asn1 import AS_REQ, AP_REQ, TGS_REQ, KERB_PA_PAC_REQUEST, KRB_ERROR, PA_ENC_TS_ENC, AS_REP, TGS_REP, \
@@ -30,7 +32,8 @@ from impacket.krb5.gssapi import CheckSumField, GSS_C_DCE_STYLE, GSS_C_MUTUAL_FL
 from impacket.krb5 import constants
 from impacket.krb5.crypto import Key, _enctype_table
 from impacket.smbconnection import SessionError
-from impacket.spnego import SPNEGO_NegTokenInit, TypesMech, SPNEGO_NegTokenResp
+from impacket.spnego import SPNEGO_NegTokenInit, TypesMech, SPNEGO_NegTokenResp, ASN1_OID, asn1encode, ASN1_AID
+from impacket.krb5.gssapi import KRB5_AP_REQ
 from impacket import nt_errors, LOG
 from impacket.krb5.ccache import CCache
 
@@ -44,8 +47,13 @@ def sendReceive(data, host, kdcHost):
     messageLen = struct.pack('!i', len(data))
 
     LOG.debug('Trying to connect to KDC at %s' % targetHost)
-    s = socket.socket()
-    s.connect((targetHost, 88))
+    try:
+        af, socktype, proto, canonname, sa = socket.getaddrinfo(targetHost, 88, 0, socket.SOCK_STREAM)[0]
+        s = socket.socket(af, socktype, proto)
+        s.connect(sa)
+    except socket.error, e:
+        raise socket.error("Connection error (%s:%s)" % (targetHost, 88), e)
+
     s.sendall(messageLen + data)
 
     recvDataLen = struct.unpack('!i', s.recv(4))[0]
@@ -77,8 +85,9 @@ def getKerberosTGT(clientName, password, domain, lmhash, nthash, aesKey='', kdcH
 
     asReq['pvno'] = 5
     asReq['msg-type'] =  int(constants.ApplicationTagNumbers.AS_REQ.value)
-    asReq['padata'] = None
-    asReq['padata'][0] = None
+
+    asReq['padata'] = noValue
+    asReq['padata'][0] = noValue
     asReq['padata'][0]['padata-type'] = int(constants.PreAuthenticationDataTypes.PA_PAC_REQUEST.value)
     asReq['padata'][0]['padata-value'] = encodedPacRequest
 
@@ -153,18 +162,26 @@ def getKerberosTGT(clientName, password, domain, lmhash, nthash, aesKey='', kdcH
         if method['padata-type'] == constants.PreAuthenticationDataTypes.PA_ETYPE_INFO2.value:
             etypes2 = decoder.decode(str(method['padata-value']), asn1Spec = ETYPE_INFO2())[0]
             for etype2 in etypes2:
-                if etype2['salt'] is None:
+                try:
+                    if etype2['salt'] is None or etype2['salt'].hasValue() is False:
+                        salt = ''
+                    else:
+                        salt = str(etype2['salt'])
+                except PyAsn1Error, e:
                     salt = ''
-                else: 
-                    salt = str(etype2['salt'])  
+
                 encryptionTypesData[etype2['etype']] = salt
         elif method['padata-type'] == constants.PreAuthenticationDataTypes.PA_ETYPE_INFO.value:
             etypes = decoder.decode(str(method['padata-value']), asn1Spec = ETYPE_INFO())[0]
             for etype in etypes:
-                if etype['salt'] is None:
+                try:
+                    if etype['salt'] is None or etype['salt'].hasValue() is False:
+                        salt = ''
+                    else:
+                        salt = str(etype['salt'])
+                except PyAsn1Error, e:
                     salt = ''
-                else: 
-                    salt = str(etype['salt'])  
+
                 encryptionTypesData[etype['etype']] = salt
 
     enctype = supportedCiphers[0]
@@ -207,12 +224,13 @@ def getKerberosTGT(clientName, password, domain, lmhash, nthash, aesKey='', kdcH
 
     asReq['pvno'] = 5
     asReq['msg-type'] =  int(constants.ApplicationTagNumbers.AS_REQ.value)
-    asReq['padata'] = None
-    asReq['padata'][0] = None
+
+    asReq['padata'] = noValue
+    asReq['padata'][0] = noValue
     asReq['padata'][0]['padata-type'] = int(constants.PreAuthenticationDataTypes.PA_ENC_TIMESTAMP.value)
     asReq['padata'][0]['padata-value'] = encodedEncryptedData
 
-    asReq['padata'][1] = None
+    asReq['padata'][1] = noValue
     asReq['padata'][1]['padata-type'] = int(constants.PreAuthenticationDataTypes.PA_PAC_REQUEST.value)
     asReq['padata'][1]['padata-value'] = encodedPacRequest
 
@@ -311,7 +329,7 @@ def getKerberosTGS(serverName, domain, kdcHost, tgt, cipher, sessionKey):
     # key (Section 5.5.1)
     encryptedEncodedAuthenticator = cipher.encrypt(sessionKey, 7, encodedAuthenticator, None)
 
-    apReq['authenticator'] = None
+    apReq['authenticator'] = noValue
     apReq['authenticator']['etype'] = cipher.enctype
     apReq['authenticator']['cipher'] = encryptedEncodedAuthenticator
 
@@ -321,8 +339,8 @@ def getKerberosTGS(serverName, domain, kdcHost, tgt, cipher, sessionKey):
 
     tgsReq['pvno'] =  5
     tgsReq['msg-type'] = int(constants.ApplicationTagNumbers.TGS_REQ.value)
-    tgsReq['padata'] = None
-    tgsReq['padata'][0] = None
+    tgsReq['padata'] = noValue
+    tgsReq['padata'][0] = noValue
     tgsReq['padata'][0]['padata-type'] = int(constants.PreAuthenticationDataTypes.PA_TGS_REQ.value)
     tgsReq['padata'][0]['padata-value'] = encodedApReq
 
@@ -343,8 +361,13 @@ def getKerberosTGS(serverName, domain, kdcHost, tgt, cipher, sessionKey):
     reqBody['till'] = KerberosTime.to_asn1(now)
     reqBody['nonce'] = random.getrandbits(31)
     seq_set_iter(reqBody, 'etype',
-                      (int(constants.EncryptionTypes.des3_cbc_sha1_kd.value),
-                       int(cipher.enctype)))
+                      (
+                          int(constants.EncryptionTypes.rc4_hmac.value),
+                          int(constants.EncryptionTypes.des3_cbc_sha1_kd.value),
+                          int(constants.EncryptionTypes.des_cbc_md5.value),
+                          int(cipher.enctype)
+                       )
+                )
 
     message = encoder.encode(tgsReq)
 
@@ -363,7 +386,9 @@ def getKerberosTGS(serverName, domain, kdcHost, tgt, cipher, sessionKey):
 
     encTGSRepPart = decoder.decode(plainText, asn1Spec = EncTGSRepPart())[0]
 
-    newSessionKey = Key(cipher.enctype, str(encTGSRepPart['key']['keyvalue']))
+    newSessionKey = Key(encTGSRepPart['key']['keytype'], str(encTGSRepPart['key']['keyvalue']))
+    # Creating new cipher based on received keytype
+    cipher = _enctype_table[encTGSRepPart['key']['keytype']]
 
     # Check we've got what we asked for
     res = decoder.decode(r, asn1Spec = TGS_REP())[0]
@@ -440,6 +465,11 @@ def getKerberosType1(username, password, domain, lmhash, nthash, aesKey='', TGT 
                 # No cache present
                 pass
             else:
+                # retrieve domain information from CCache file if needed
+                if domain == '':
+                    domain = ccache.principal.realm['data']
+                    LOG.debug('Domain retrieved from CCache: %s' % domain)
+
                 LOG.debug("Using Kerberos Cache: %s" % os.getenv('KRB5CCNAME'))
                 principal = 'host/%s@%s' % (targetName.upper(), domain.upper())
                 creds = ccache.getCredential(principal)
@@ -453,7 +483,15 @@ def getKerberosType1(username, password, domain, lmhash, nthash, aesKey='', TGT 
                     else:
                         LOG.debug("No valid credentials found in cache. ")
                 else:
-                    TGS = creds.toTGS()
+                    TGS = creds.toTGS(principal)
+
+                # retrieve user information from CCache file if needed
+                if username == '' and creds is not None:
+                    username = creds['client'].prettyPrint().split('@')[0]
+                    LOG.debug('Username retrieved from CCache: %s' % username)
+                elif username == '' and len(ccache.principal.components) > 0:
+                    username = ccache.principal.components[0]['data']
+                    LOG.debug('Username retrieved from CCache: %s' % username)
 
     # First of all, we need to get a TGT for the user
     userName = Principal(username, type=constants.PrincipalNameType.NT_PRINCIPAL.value)
@@ -545,7 +583,7 @@ def getKerberosType1(username, password, domain, lmhash, nthash, aesKey='', TGT 
     authenticator['ctime'] = KerberosTime.to_asn1(now)
 
     
-    authenticator['cksum'] = None
+    authenticator['cksum'] = noValue
     authenticator['cksum']['cksumtype'] = 0x8003
 
     chkField = CheckSumField()
@@ -563,11 +601,12 @@ def getKerberosType1(username, password, domain, lmhash, nthash, aesKey='', TGT 
     # (Section 5.5.1)
     encryptedEncodedAuthenticator = cipher.encrypt(sessionKey, 11, encodedAuthenticator, None)
 
-    apReq['authenticator'] = None
+    apReq['authenticator'] = noValue
     apReq['authenticator']['etype'] = cipher.enctype
     apReq['authenticator']['cipher'] = encryptedEncodedAuthenticator
 
-    blob['MechToken'] = encoder.encode(apReq)
+    blob['MechToken'] = struct.pack('B', ASN1_AID) + asn1encode( struct.pack('B', ASN1_OID) + asn1encode(
+            TypesMech['KRB5 - Kerberos 5'] ) + KRB5_AP_REQ + encoder.encode(apReq))
 
     return cipher, sessionKey, blob.getData()
 

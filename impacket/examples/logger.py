@@ -1,5 +1,5 @@
-#!/usr/bin/python
-# Copyright (c) 2003-2015 CORE Security Technologies
+#!/usr/bin/env python
+# Copyright (c) 2003-2016 CORE Security Technologies
 #
 # This software is provided under under a slightly modified version
 # of the Apache Software License. See the accompanying LICENSE file

@@ -1,4 +1,4 @@
-# Copyright (c) 2003-2015 CORE Security Technologies
+# Copyright (c) 2003-2016 CORE Security Technologies
 #
 # This software is provided under under a slightly modified version
 # of the Apache Software License. See the accompanying LICENSE file
@@ -18,11 +18,13 @@ from datetime import datetime
 from struct import pack, unpack, calcsize
 
 from pyasn1.codec.der import decoder, encoder
+from pyasn1.type.univ import noValue
 from binascii import hexlify
 
 from impacket.structure import Structure
 from impacket.krb5 import crypto, constants, types
 from impacket.krb5.asn1 import AS_REP, seq_set, TGS_REP, EncTGSRepPart, EncASRepPart, Ticket
+from impacket import LOG
 
 DELTA_TIME = 1
 
@@ -87,15 +89,15 @@ class AuthData(Structure):
         ('authdata',':', CountedOctetString),
     )
 
-class Principal():
+class Principal:
     class PrincipalHeader(Structure):
         structure = (
             ('name_type','!L=0'),
             ('num_components','!L=0'),
         )
-    components = []
-    realm = None
     def __init__(self, data=None):
+        self.components = []
+        self.realm = None
         if data is not None:
             self.header = self.PrincipalHeader(data)
             data = data[len(self.header):]
@@ -150,7 +152,7 @@ class Principal():
     def toPrincipal(self):
         return types.Principal(self.prettyPrint(), type=self.header['name_type'])
 
-class Credential():
+class Credential:
     class CredentialHeader(Structure):
         structure = (
             ('client',':', Principal),
@@ -162,13 +164,13 @@ class Credential():
             ('num_address','!L=0'),
         )
 
-    addresses = ()
-    authData = ()
-    header = None
-    ticket = None
-    secondTicket = None
- 
     def __init__(self, data=None):
+        self.addresses = ()
+        self.authData = ()
+        self.header = None
+        self.ticket = None
+        self.secondTicket = None
+
         if data is not None:
             self.header = self.CredentialHeader(data)
             data = data[len(self.header):]
@@ -247,12 +249,12 @@ class Credential():
     def toTGT(self):
         tgt_rep = AS_REP()
         tgt_rep['pvno'] = 5
-        tgt_rep['msg-type'] = int(constants.ApplicationTagNumbers.AP_REP.value)
+        tgt_rep['msg-type'] = int(constants.ApplicationTagNumbers.AS_REP.value)
         tgt_rep['crealm'] = self['server'].realm['data']
 
         # Fake EncryptedData
-        tgt_rep['enc-part'] = None
-        tgt_rep['enc-part']['etype'] = 1 
+        tgt_rep['enc-part'] = noValue
+        tgt_rep['enc-part']['etype'] = 1
         tgt_rep['enc-part']['cipher'] = '' 
         seq_set(tgt_rep, 'cname', self['client'].toPrincipal().components_to_asn1)
         ticket = types.Ticket()
@@ -267,19 +269,23 @@ class Credential():
         tgt['sessionKey'] = crypto.Key(cipher.enctype, str(self['key']['keyvalue']))
         return tgt
         
-    def toTGS(self):
+    def toTGS(self, newSPN=None):
         tgs_rep = TGS_REP()
         tgs_rep['pvno'] = 5
         tgs_rep['msg-type'] = int(constants.ApplicationTagNumbers.TGS_REP.value)
         tgs_rep['crealm'] = self['server'].realm['data']
 
         # Fake EncryptedData
-        tgs_rep['enc-part'] = None
-        tgs_rep['enc-part']['etype'] = 1 
+        tgs_rep['enc-part'] = noValue
+        tgs_rep['enc-part']['etype'] = 1
         tgs_rep['enc-part']['cipher'] = '' 
         seq_set(tgs_rep, 'cname', self['client'].toPrincipal().components_to_asn1)
         ticket = types.Ticket()
         ticket.from_asn1(self.ticket['data'])
+        if newSPN is not None:
+            if newSPN.upper() != str(ticket.service_principal).upper():
+                LOG.debug('Changing sname from %s to %s and hoping for the best' % (ticket.service_principal, newSPN) )
+                ticket.service_principal = types.Principal(newSPN, type=int(ticket.service_principal.type))
         seq_set(tgs_rep,'ticket', ticket.to_asn1)
 
         cipher = crypto._enctype_table[self['key']['keytype']]()
@@ -290,11 +296,7 @@ class Credential():
         tgs['sessionKey'] = crypto.Key(cipher.enctype, str(self['key']['keyvalue']))
         return tgs
         
-class CCache():
-    headers = None
-    principal = None
-    credentials = []
-    miniHeader = None
+class CCache:
     class MiniHeader(Structure):
         structure = (
             ('file_format_version','!H=0x0504'),
@@ -302,6 +304,10 @@ class CCache():
         )
 
     def __init__(self, data = None):
+        self.headers = None
+        self.principal = None
+        self.credentials = []
+        self.miniHeader = None
         if data is not None:
             miniHeader = self.MiniHeader(data)
             data = data[len(str(miniHeader)):]
@@ -336,10 +342,22 @@ class CCache():
             data += credential.getData()
         return data
 
-    def getCredential(self, server):
+    def getCredential(self, server, anySPN=True):
         for c in self.credentials:
             if c['server'].prettyPrint().upper() == server.upper():
+                LOG.debug('Returning cached credential for %s' % c['server'].prettyPrint().upper())
                 return c
+        LOG.debug('SPN %s not found in cache' % server.upper())
+        if anySPN is True:
+            LOG.debug('AnySPN is True, looking for another suitable SPN')
+            for c in self.credentials:
+                # Let's search for any TGT/TGS that matches the server w/o the SPN's service type, returns
+                # the first one
+                if c['server'].prettyPrint().find('/') >=0:
+                    if c['server'].prettyPrint().upper().split('/')[1] == server.upper().split('/')[1]:
+                        LOG.debug('Returning cached credential for %s' % c['server'].prettyPrint().upper())
+                        return c
+
         return None
 
     def toTimeStamp(self, dt, epoch=datetime(1970,1,1)):

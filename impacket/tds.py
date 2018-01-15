@@ -1,5 +1,5 @@
-#!/usr/bin/python
-# Copyright (c) 2003-2015 CORE Security Technologies
+#!/usr/bin/env python
+# Copyright (c) 2003-2016 CORE Security Technologies
 #
 # This software is provided under under a slightly modified version
 # of the Apache Software License. See the accompanying LICENSE file
@@ -37,7 +37,7 @@ try:
     from OpenSSL import SSL, crypto
 except:
     LOG.critical("pyOpenSSL is not installed, can't continue")
-    sys.exit(1)
+    raise
 
 # We need to have a fake Logger to be compatible with the way Impact 
 # prints information. Outside Impact it's just a print. Inside 
@@ -632,7 +632,7 @@ class MSSQL:
 
             # Switching to TLS now
             ctx = SSL.Context(SSL.TLSv1_METHOD)
-            ctx.set_cipher_list('RC4')
+            ctx.set_cipher_list('RC4, AES256')
             tls = SSL.Connection(ctx,None)
             tls.set_connect_state()
             while True:
@@ -671,6 +671,7 @@ class MSSQL:
         from impacket.krb5 import constants
         from impacket.krb5.types import Principal, KerberosTime, Ticket
         from pyasn1.codec.der import decoder, encoder
+        from pyasn1.type.univ import noValue
         from impacket.krb5.ccache import CCache
         import os
         import datetime
@@ -682,6 +683,11 @@ class MSSQL:
                 # No cache present
                 pass
             else:
+                # retrieve domain information from CCache file if needed
+                if domain == '':
+                    domain = ccache.principal.realm['data']
+                    LOG.debug('Domain retrieved from CCache: %s' % domain)
+
                 LOG.debug("Using Kerberos Cache: %s" % os.getenv('KRB5CCNAME'))
                 principal = 'MSSQLSvc/%s.%s:%d' % (self.server, domain, self.port)
                 creds = ccache.getCredential(principal)
@@ -695,8 +701,16 @@ class MSSQL:
                     else:
                         LOG.debug("No valid credentials found in cache. ")
                 else:
-                    TGS = creds.toTGS()
+                    TGS = creds.toTGS(principal)
                     LOG.debug('Using TGS from cache')
+
+                # retrieve user information from CCache file if needed
+                if username == '' and creds is not None:
+                    username = creds['client'].prettyPrint().split('@')[0]
+                    LOG.debug('Username retrieved from CCache: %s' % username)
+                elif username == '' and len(ccache.principal.components) > 0:
+                    username = ccache.principal.components[0]['data']
+                    LOG.debug('Username retrieved from CCache: %s' % username)
 
         # First of all, we need to get a TGT for the user
         userName = Principal(username, type=constants.PrincipalNameType.NT_PRINCIPAL.value)
@@ -801,7 +815,7 @@ class MSSQL:
         # (Section 5.5.1)
         encryptedEncodedAuthenticator = cipher.encrypt(sessionKey, 11, encodedAuthenticator, None)
 
-        apReq['authenticator'] = None
+        apReq['authenticator'] = noValue
         apReq['authenticator']['etype'] = cipher.enctype
         apReq['authenticator']['cipher'] = encryptedEncodedAuthenticator
 
@@ -846,7 +860,7 @@ class MSSQL:
 
             # Switching to TLS now
             ctx = SSL.Context(SSL.TLSv1_METHOD)
-            ctx.set_cipher_list('RC4')
+            ctx.set_cipher_list('RC4, AES256')
             tls = SSL.Connection(ctx,None)
             tls.set_connect_state()
             while True:
@@ -881,7 +895,7 @@ class MSSQL:
         if useWindowsAuth is True:
             login['OptionFlags2'] |= TDS_INTEGRATED_SECURITY_ON
             # NTLMSSP Negotiate
-            auth = ntlm.getNTLMSSPType1('WORKSTATION','')
+            auth = ntlm.getNTLMSSPType1('','')
             login['SSPI'] = str(auth)
         else:
             login['UserName'] = username.encode('utf-16le')

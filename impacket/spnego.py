@@ -1,4 +1,4 @@
-# Copyright (c) 2003-2015 CORE Security Technologies)
+# Copyright (c) 2003-2016 CORE Security Technologies
 #
 # This software is provided under under a slightly modified version
 # of the Apache Software License. See the accompanying LICENSE file
@@ -205,7 +205,7 @@ class SPNEGO_NegTokenResp:
             next_byte = unpack('B', decode_data2[:1])[0]
             if next_byte != ASN1_ENUMERATED:
                 raise Exception('Enumerated tag not found %x' % next_byte)
-            item, total_bytes2 = asn1decode(decode_data)
+            item, total_bytes2 = asn1decode(decode_data2[1:])
             self['NegResult'] = item
             decode_data = decode_data[1:]
             decode_data = decode_data[total_bytes:]
@@ -226,7 +226,7 @@ class SPNEGO_NegTokenResp:
                     raise Exception('OID tag not found %x' % next_byte)
                 decode_data2 = decode_data2[1:]
                 item, total_bytes2 = asn1decode(decode_data2)
-                self['SuportedMech'] = item
+                self['SupportedMech'] = item
 
                 decode_data = decode_data[1:]
                 decode_data = decode_data[total_bytes:]

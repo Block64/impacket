@@ -1,4 +1,4 @@
-# Copyright (c) 2003-2015 CORE Security Technologies)
+# Copyright (c) 2003-2016 CORE Security Technologies
 #
 # This software is provided under under a slightly modified version
 # of the Apache Software License. See the accompanying LICENSE file
@@ -46,10 +46,12 @@ from binascii import a2b_hex
 import datetime
 from struct import pack, unpack
 from contextlib import contextmanager
+from pyasn1.type.univ import noValue
 
 from impacket import nmb, ntlm, nt_errors, LOG
 from impacket.structure import Structure
-from impacket.spnego import SPNEGO_NegTokenInit, TypesMech, SPNEGO_NegTokenResp
+from impacket.spnego import SPNEGO_NegTokenInit, TypesMech, SPNEGO_NegTokenResp, ASN1_OID, asn1encode, ASN1_AID
+from impacket.krb5.gssapi import KRB5_AP_REQ
 
 # For signing
 import hashlib
@@ -486,7 +488,7 @@ class SessionError(Exception):
 
 
 
-    def __init__( self, error_string, error_class, error_code, nt_status = 0):
+    def __init__( self, error_string, error_class, error_code, nt_status = 0, packet=0):
         Exception.__init__(self, error_string)
         self.nt_status = nt_status
         self._args = error_string
@@ -496,13 +498,16 @@ class SessionError(Exception):
         else:
            self.error_class = error_class
            self.error_code = error_code
-
+        self.packet = packet
 
     def get_error_class( self ):
         return self.error_class
 
     def get_error_code( self ):
         return self.error_code
+
+    def get_error_packet(self):
+        return self.packet
 
     def __str__( self ):
         error_class = SessionError.error_classes.get( self.error_class, None )
@@ -709,7 +714,7 @@ class NewSMBPacket(Structure):
                 return 1
             elif self.isMoreProcessingRequired():
                 return 1
-            raise SessionError, ("SMB Library Error", self['ErrorClass'] + (self['_reserved'] << 8), self['ErrorCode'], self['Flags2'] & SMB.FLAGS2_NT_STATUS)
+            raise SessionError, ("SMB Library Error", self['ErrorClass'] + (self['_reserved'] << 8), self['ErrorCode'], self['Flags2'] & SMB.FLAGS2_NT_STATUS, self)
         else:
             raise UnsupportedFeature, ("Unexpected answer from server: Got %d, Expected %d" % (self['Command'], cmd))
 
@@ -1409,9 +1414,16 @@ class SMBSessionSetupAndX_Extended_Response_Data(AsciiOrUnicodeStructure):
     UnicodeStructure = (
         ('SecurityBlobLength','_-SecurityBlob','self["SecurityBlobLength"]'),
         ('SecurityBlob',':'),
+        ('PadLen','_-Pad','1 if (len(self["SecurityBlob"]) % 2 == 0) else 0'),
+        ('Pad',':=""'),
         ('NativeOS','u=""'),
         ('NativeLanMan','u=""'),
     )
+    def getData(self):
+        if self.structure == self.UnicodeStructure:
+            if len(str(self['SecurityBlob'])) % 2 == 0:
+                self['Pad'] = '\x00'
+        return AsciiOrUnicodeStructure.getData(self)
 
 ############# SMB_COM_TREE_CONNECT (0x70)
 class SMBTreeConnect_Parameters(SMBCommand_Parameters):
@@ -1762,6 +1774,7 @@ class SMBTransaction2Secondary_Parameters(SMBCommand_Parameters):
         ('TotalDataCount','<H'),
         ('ParameterCount','<H'),
         ('ParameterOffset','<H'),
+        ('ParameterDisplacement','<H'),
         ('DataCount','<H'),
         ('DataOffset','<H'),
         ('DataDisplacement','<H=0'),
@@ -2325,10 +2338,12 @@ class SMB:
     SMB_SUPPORT_SEARCH_BITS                 = 0x01
     SMB_SHARE_IS_IN_DFS                     = 0x02
 
-    def __init__(self, remote_name, remote_host, my_name = None, host_type = nmb.TYPE_SERVER, sess_port = 445, timeout=None, UDP = 0, session = None, negPacket = None):
+    def __init__(self, remote_name, remote_host, my_name=None, host_type=nmb.TYPE_SERVER, sess_port=445, timeout=None,
+                 UDP=0, session=None, negPacket=None):
         # The uid attribute will be set when the client calls the login() method
         self._uid = 0
         self.__server_name = ''
+        self.__client_name = ''
         self.__server_os = ''
         self.__server_os_major = None
         self.__server_os_minor = None
@@ -2341,6 +2356,8 @@ class SMB:
         self.__isNTLMv2 = True
         self._dialects_parameters = None
         self._dialects_data = None
+        self._doKerberos = False
+
         # Credentials
         self.__userName = ''
         self.__password = ''
@@ -2386,8 +2403,15 @@ class SMB:
         if sess_port == 445 and remote_name == '*SMBSERVER':
            self.__remote_name = remote_host
 
+        # This is on purpose. I'm still not convinced to do a socket.gethostname() if not specified
+        if my_name is None:
+            self.__client_name = ''
+        else:
+            self.__client_name = my_name
+
         if session is None:
             if not my_name:
+                # If destination port is 139 yes, there's some client disclosure
                 my_name = socket.gethostname()
                 i = string.find(my_name, '.')
                 if i > -1:
@@ -2419,8 +2443,15 @@ class SMB:
     def ntlm_supported():
         return False
 
+    def getKerberos(self):
+        return self._doKerberos
+
     def get_remote_name(self):
         return self.__remote_name
+
+    def set_remote_name(self, name):
+        self.__remote_name = name
+        return True
 
     def get_remote_host(self):
         return self.__remote_host
@@ -2465,9 +2496,10 @@ class SMB:
     def doesSupportNTLMv2(self):
         return self.__isNTLMv2
 
-    def __del__(self):
+    def close_session(self):
         if self._sess:
             self._sess.close()
+            self._sess = None
 
     def recvSMB(self):
         r = self._sess.recv_packet(self.__timeout)
@@ -2591,8 +2623,12 @@ class SMB:
         if negPacket is None:
             smb = NewSMBPacket()
             negSession = SMBCommand(SMB.SMB_COM_NEGOTIATE)
+            flags2 = self.get_flags()[1]
             if extended_security is True:
-                smb['Flags2']=SMB.FLAGS2_EXTENDED_SECURITY
+                self.set_flags(flags2=flags2|SMB.FLAGS2_EXTENDED_SECURITY)
+            else:
+                self.set_flags(flags2=flags2 & (~SMB.FLAGS2_EXTENDED_SECURITY))
+
             negSession['Data'] = '\x02NT LM 0.12\x00'
             smb.addCommand(negSession)
             self.sendSMB(smb)
@@ -2722,6 +2758,9 @@ class SMB:
     def get_server_name(self):
         #return self._dialects_data['ServerName']
         return self.__server_name
+
+    def get_client_name(self):
+        return self.__client_name
 
     def get_session_key(self):
         return self._SigningSessionKey
@@ -3031,6 +3070,7 @@ class SMB:
         self.__kdc      = kdcHost
         self.__TGT      = TGT
         self.__TGS      = TGS
+        self._doKerberos= True
 
         # First of all, we need to get a TGT for the user
         userName = Principal(user, type=constants.PrincipalNameType.NT_PRINCIPAL.value)
@@ -3109,11 +3149,12 @@ class SMB:
         # (Section 5.5.1)
         encryptedEncodedAuthenticator = cipher.encrypt(sessionKey, 11, encodedAuthenticator, None)
 
-        apReq['authenticator'] = None
+        apReq['authenticator'] = noValue
         apReq['authenticator']['etype'] = cipher.enctype
         apReq['authenticator']['cipher'] = encryptedEncodedAuthenticator
 
-        blob['MechToken'] = encoder.encode(apReq)
+        blob['MechToken'] = pack('B', ASN1_AID) + asn1encode(pack('B', ASN1_OID) + asn1encode(
+            TypesMech['KRB5 - Kerberos 5']) + KRB5_AP_REQ + encoder.encode(apReq))
 
         sessionSetup['Parameters']['SecurityBlobLength']  = len(blob)
         sessionSetup['Parameters'].getData()
@@ -3185,7 +3226,7 @@ class SMB:
 
         # NTLMSSP
         blob['MechTypes'] = [TypesMech['NTLMSSP - Microsoft NTLM Security Support Provider']]
-        auth = ntlm.getNTLMSSPType1('',domain,self._SignatureRequired, use_ntlmv2 = use_ntlmv2)
+        auth = ntlm.getNTLMSSPType1(self.get_client_name(),domain,self._SignatureRequired, use_ntlmv2 = use_ntlmv2)
         blob['MechToken'] = str(auth)
 
         sessionSetup['Parameters']['SecurityBlobLength']  = len(blob)
@@ -3300,6 +3341,16 @@ class SMB:
             self.__TGT,
             self.__TGS)
 
+    def getIOCapabilities(self):
+        res = dict()
+        if (self._dialects_parameters['Capabilities'] & SMB.CAP_LARGE_READX) and self._SignatureEnabled is False:
+            max_size = 65000
+        else:
+            max_size = self._dialects_parameters['MaxBufferSize'] # Read in multiple KB blocks
+        res['MaxReadSize'] = max_size
+        res['MaxWriteSize'] = max_size
+        return res
+
     def login(self, user, password, domain = '', lmhash = '', nthash = '', ntlm_fallback = True):
 
         # If we have hashes, normalize them
@@ -3371,7 +3422,7 @@ class SMB:
 
         sessionSetup['Parameters']['MaxBuffer']        = 61440
         sessionSetup['Parameters']['MaxMpxCount']      = 2
-        sessionSetup['Parameters']['VCNumber']         = os.getpid()
+        sessionSetup['Parameters']['VCNumber']         = os.getpid() & 0xFFFF # Value has to be expressed in 2 bytes
         sessionSetup['Parameters']['SessionKey']       = self._dialects_parameters['SessionKey']
         sessionSetup['Parameters']['AnsiPwdLength']    = len(pwd_ansi)
         sessionSetup['Parameters']['UnicodePwdLength'] = len(pwd_unicode)
@@ -4012,6 +4063,100 @@ class SMB:
 
     def get_socket(self):
         return self._sess.get_socket()
+
+    def send_nt_trans(self, tid, function, max_param_count, setup='', param='', data=''):
+        """
+        [MS-CIFS]: 2.2.4.62.1 SMB_COM_NT_TRANSACT request.
+        :param tid:
+        :param function: The transaction subcommand code
+        :param max_param_count:  This field MUST be set as specified in the subsections of Transaction subcommands.
+        :param setup: Transaction context to the server, depends on transaction subcommand.
+        :param param: Subcommand parameter bytes if any, depends on transaction subcommand.
+        :param data: Subcommand data bytes if any, depends on transaction subcommand.
+        :return: Buffer relative to requested subcommand.
+        """
+        smb_packet = NewSMBPacket()
+        smb_packet['Tid'] = tid
+        #    setup depends on NT_TRANSACT subcommands so it may be 0.
+        setup_bytes = pack('<H', setup) if setup != '' else ''
+
+        transCommand = SMBCommand(SMB.SMB_COM_NT_TRANSACT)
+        transCommand['Parameters'] = SMBNTTransaction_Parameters()
+        transCommand['Parameters']['MaxDataCount'] = self._dialects_parameters['MaxBufferSize']
+        transCommand['Parameters']['Setup'] = setup_bytes
+        transCommand['Parameters']['Function'] = function
+        transCommand['Parameters']['TotalParameterCount'] = len(param)
+        transCommand['Parameters']['TotalDataCount'] = len(data)
+        transCommand['Parameters']['MaxParameterCount'] = max_param_count
+        transCommand['Parameters']['MaxSetupCount'] = 0
+
+        transCommand['Data'] = SMBNTTransaction_Data()
+
+        # SMB header size + SMB_COM_NT_TRANSACT parameters size + length of setup bytes.
+        offset = 32 + 3 + 38 + len(setup_bytes)
+        transCommand['Data']['Pad1'] = ''
+        if offset % 4 != 0:
+            transCommand['Data']['Pad1'] = '\0' * (4 - offset % 4)
+            offset += (4 - offset % 4)  # pad1 length
+
+        if len(param) > 0:
+            transCommand['Parameters']['ParameterOffset'] = offset
+        else:
+            transCommand['Parameters']['ParameterOffset'] = 0
+
+        offset += len(param)
+        transCommand['Data']['Pad2'] = ''
+        if offset % 4 != 0:
+            transCommand['Data']['Pad2'] = '\0' * (4 - offset % 4)
+            offset += (4 - offset % 4)
+
+        if len(data) > 0:
+            transCommand['Parameters']['DataOffset'] = offset
+        else:
+            transCommand['Parameters']['DataOffset'] = 0
+
+        transCommand['Parameters']['DataCount'] = len(data)
+        transCommand['Parameters']['ParameterCount'] = len(param)
+        transCommand['Data']['NT_Trans_Parameters'] = param
+        transCommand['Data']['NT_Trans_Data'] = data
+        smb_packet.addCommand(transCommand)
+
+        self.sendSMB(smb_packet)
+
+    def query_sec_info(self, tid, fid, additional_information=7):
+        """
+        [MS-CIFS]: 2.2.7.6.1
+        NT_TRANSACT_QUERY_SECURITY_DESC 0x0006
+        :param tid: valid tree id.
+        :param fid: valid file handle.
+        :param additional_information: SecurityInfoFields. default = owner + group + dacl ie. 7
+        :return: security descriptor buffer
+        """
+        self.send_nt_trans(tid, function=0x0006, max_param_count=4,
+                           param=pack('<HHL', fid, 0x0000, additional_information))
+        resp = self.recvSMB()
+        if resp.isValidAnswer(SMB.SMB_COM_NT_TRANSACT):
+            nt_trans_response = SMBCommand(resp['Data'][0])
+            nt_trans_parameters = SMBNTTransactionResponse_Parameters(nt_trans_response['Parameters'])
+            # Remove Potential Prefix Padding
+            return nt_trans_response['Data'][-nt_trans_parameters['TotalDataCount']:]
+
+    def echo(self, text = '', count = 1):
+
+        smb = NewSMBPacket()
+        comEcho = SMBCommand(SMB.SMB_COM_ECHO)
+        comEcho['Parameters'] = SMBEcho_Parameters()
+        comEcho['Data']       = SMBEcho_Data()
+        comEcho['Parameters']['EchoCount'] = count
+        comEcho['Data']['Data'] = text
+        smb.addCommand(comEcho)
+
+        self.sendSMB(smb)
+
+        for i in range(count):
+            resp = self.recvSMB()
+            resp.isValidAnswer(SMB.SMB_COM_ECHO)
+        return True
 
 ERRDOS = { 1: 'Invalid function',
            2: 'File not found',

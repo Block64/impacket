@@ -1,4 +1,4 @@
-# Copyright (c) 2003-2015 CORE Security Technologies
+# Copyright (c) 2003-2016 CORE Security Technologies
 #
 # This software is provided under under a slightly modified version
 # of the Apache Software License. See the accompanying LICENSE file
@@ -136,6 +136,7 @@ class ENCODED_STRING(Structure):
             # Let's first check the commonHdr
             self.fromString(data)
             self.structure = ()
+            self.isUnicode = False
             if len(data) > 1:
                 if self['Encoded_String_Flag'] == 0:
                     self.structure += self.tascii
@@ -144,12 +145,17 @@ class ENCODED_STRING(Structure):
                     data  = data[:index+1+1]
                 else:
                     self.structure = self.tunicode
-                    index = data[1:].find('\x00\x00')
-                    data = data[:index+1+2]
-            self.fromString(data)
+                    self.isUnicode = True
+
+                self.fromString(data)
         else:
             self.structure = self.tascii
             self.data = None
+
+    def __getitem__(self, key):
+        if key == 'Character' and self.isUnicode:
+            return self.fields['Character'].decode('utf-16le')
+        return Structure.__getitem__(self, key)
 
 
 # 2.2.8 DecServerName
@@ -2321,7 +2327,6 @@ class IWbemClassObject(IRemUnknown):
         # we need to update the values
         # That's what we'll do
 
-        # Max 16 parameters!!!
         instanceHeap = ''
         valueTable = ''
         ndTable = 0
@@ -2378,14 +2383,10 @@ class IWbemClassObject(IRemUnknown):
                     curHeapPtr = len(instanceHeap)
 
         ndTableLen = (len(properties) - 1) / 4 + 1
-        if ndTableLen == 1:
-            packStr = 'B'
-        elif ndTableLen == 2:
-            packStr = '<H'
-        else:
-            packStr = '<L'
-
-        ndTable = pack(packStr, ndTable)
+        packedNdTable = ''
+        for i in range(ndTableLen):
+            packedNdTable += pack('B', ndTable & 0xff)
+            ndTable >>=  8
 
         # Now let's update the structure
         objRef = self.get_objRef()
@@ -2395,7 +2396,7 @@ class IWbemClassObject(IRemUnknown):
         currentClass = encodingUnit['ObjectBlock']['InstanceType']['CurrentClass']
         encodingUnit['ObjectBlock']['InstanceType']['CurrentClass'] = ''
 
-        encodingUnit['ObjectBlock']['InstanceType']['NdTable_ValueTable'] = ndTable + valueTable
+        encodingUnit['ObjectBlock']['InstanceType']['NdTable_ValueTable'] = packedNdTable + valueTable
         encodingUnit['ObjectBlock']['InstanceType']['InstanceHeap']['HeapLength'] = len(instanceHeap) | 0x80000000
         encodingUnit['ObjectBlock']['InstanceType']['InstanceHeap']['HeapItem'] = instanceHeap
 
@@ -2436,7 +2437,6 @@ class IWbemClassObject(IRemUnknown):
             instanceHeap += str(parametersClass)
             curHeapPtr = len(instanceHeap)
 
-            # Max 16 parameters!!!
             ndTable = 0
             properties = self.getProperties()
 
@@ -2472,16 +2472,12 @@ class IWbemClassObject(IRemUnknown):
                     curHeapPtr = len(instanceHeap)
 
             ndTableLen = (len(properties) - 1) / 4 + 1
-            if ndTableLen == 1:
-                packStr = 'B'
-            elif ndTableLen == 2:
-                packStr = '<H'
-            else:
-                packStr = '<L'
+            packedNdTable = ''
+            for i in range(ndTableLen):
+                packedNdTable += pack('B', ndTable & 0xff)
+                ndTable >>=  8
 
-            ndTable = pack(packStr, ndTable)
-
-            instanceType['NdTable_ValueTable'] = ndTable + valueTable
+            instanceType['NdTable_ValueTable'] = packedNdTable + valueTable
 
             instanceType['InstanceQualifierSet'] = '\x04\x00\x00\x00\x01'
 
@@ -2560,7 +2556,7 @@ class IWbemClassObject(IRemUnknown):
                 parametersClass['Character'] = '__PARAMETERS'
                 instanceHeap += str(parametersClass)
                 curHeapPtr = len(instanceHeap)
-                # Max 16 parameters!!!
+
                 ndTable = 0
                 for i in range(len(args)):
                     paramDefinition = methodDefinition['InParams'].values()[i]
@@ -2595,22 +2591,27 @@ class IWbemClassObject(IRemUnknown):
                             ndTable |= 3 << (2*i)
                     else:
                         strIn = ENCODED_STRING()
-                        strIn['Character'] = inArg
+                        if type(inArg) is unicode:
+                            # The Encoded-String-Flag is set to 0x01 if the sequence of characters that follows
+                            # consists of UTF-16 characters (as specified in [UNICODE]) followed by a UTF-16 null
+                            # terminator.
+                            strIn['Encoded_String_Flag'] = 0x1
+                            strIn.structure = strIn.tunicode
+                            strIn['Character'] = inArg.encode('utf-16le')
+                        else:
+                            strIn['Character'] = inArg
                         valueTable += pack('<L', curHeapPtr)
                         instanceHeap += str(strIn)
                         curHeapPtr = len(instanceHeap)
 
                 ndTableLen = (len(args) - 1) / 4 + 1
-                if ndTableLen == 1:
-                    packStr = 'B'
-                elif ndTableLen == 2:
-                    packStr = '<H'
-                else:
-                    packStr = '<L'
 
-                ndTable = pack(packStr, ndTable)
- 
-                instanceType['NdTable_ValueTable'] = ndTable + valueTable
+                packedNdTable = ''
+                for i in range(ndTableLen):
+                    packedNdTable += pack('B', ndTable & 0xff)
+                    ndTable >>=  8
+
+                instanceType['NdTable_ValueTable'] = packedNdTable + valueTable
                 heapRecord = HEAP()
                 heapRecord['HeapLength'] = len(instanceHeap) | 0x80000000
                 heapRecord['HeapItem'] = instanceHeap

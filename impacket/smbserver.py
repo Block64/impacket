@@ -1,4 +1,4 @@
-# Copyright (c) 2003-2015 CORE Security Technologies)
+# Copyright (c) 2003-2016 CORE Security Technologies
 #
 # This software is provided under under a slightly modified version
 # of the Apache Software License. See the accompanying LICENSE file
@@ -39,7 +39,10 @@ import sys
 import random
 import shutil
 import string
-from binascii import unhexlify, hexlify
+import hashlib
+import hmac
+
+from binascii import unhexlify, hexlify, a2b_hex
 
 # For signing
 from impacket import smb, nmb, ntlm, uuid, LOG
@@ -49,7 +52,11 @@ from impacket.nt_errors import STATUS_NO_MORE_FILES, STATUS_NETWORK_NAME_DELETED
     STATUS_FILE_CLOSED, STATUS_MORE_PROCESSING_REQUIRED, STATUS_OBJECT_PATH_NOT_FOUND, STATUS_DIRECTORY_NOT_EMPTY, \
     STATUS_FILE_IS_A_DIRECTORY, STATUS_NOT_IMPLEMENTED, STATUS_INVALID_HANDLE, STATUS_OBJECT_NAME_COLLISION, \
     STATUS_NO_SUCH_FILE, STATUS_CANCELLED, STATUS_OBJECT_NAME_NOT_FOUND, STATUS_SUCCESS, STATUS_ACCESS_DENIED, \
-    STATUS_NOT_SUPPORTED, STATUS_INVALID_DEVICE_REQUEST, STATUS_FS_DRIVER_REQUIRED, STATUS_INVALID_INFO_CLASS
+    STATUS_NOT_SUPPORTED, STATUS_INVALID_DEVICE_REQUEST, STATUS_FS_DRIVER_REQUIRED, STATUS_INVALID_INFO_CLASS, \
+    STATUS_LOGON_FAILURE
+
+# Setting LOG to current's module name
+LOG = logging.getLogger(__name__)
 
 # These ones not defined in nt_errors
 STATUS_SMB_BAD_UID = 0x005B0002
@@ -60,6 +67,62 @@ STATUS_SMB_BAD_TID = 0x00050002
 # There are some common functions that can be accessed from more than one SMB 
 # command (or either TRANSACTION). That's why I'm putting them here
 # TODO: Return NT ERROR Codes
+
+def computeNTLMv2(identity, lmhash, nthash, serverChallenge, authenticateMessage, ntlmChallenge, type1):
+    # Let's calculate the NTLMv2 Reponse
+
+
+    responseKeyNT = ntlm.NTOWFv2(identity, '', authenticateMessage['domain_name'].decode('utf-16le'), nthash)
+    responseKeyLM = ntlm.LMOWFv2(identity, '', authenticateMessage['domain_name'].decode('utf-16le'), lmhash)
+
+    ntProofStr = authenticateMessage['ntlm'][:16]
+    temp = authenticateMessage['ntlm'][16:]
+    ntProofStr2 = ntlm.hmac_md5(responseKeyNT, serverChallenge + temp)
+    lmChallengeResponse = authenticateMessage['lanman']
+    sessionBaseKey = ntlm.hmac_md5(responseKeyNT, ntProofStr)
+
+    responseFlags = type1['flags']
+
+    # Let's check the return flags
+    if (ntlmChallenge['flags'] & ntlm.NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY) == 0:
+        # No extended session security, taking it out
+        responseFlags &= 0xffffffff ^ ntlm.NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY
+    if (ntlmChallenge['flags'] & ntlm.NTLMSSP_NEGOTIATE_128) == 0:
+        # No support for 128 key len, taking it out
+        responseFlags &= 0xffffffff ^ ntlm.NTLMSSP_NEGOTIATE_128
+    if (ntlmChallenge['flags'] & ntlm.NTLMSSP_NEGOTIATE_KEY_EXCH) == 0:
+        # No key exchange supported, taking it out
+        responseFlags &= 0xffffffff ^ ntlm.NTLMSSP_NEGOTIATE_KEY_EXCH
+    if (ntlmChallenge['flags'] & ntlm.NTLMSSP_NEGOTIATE_SEAL) == 0:
+        # No sign available, taking it out
+        responseFlags &= 0xffffffff ^ ntlm.NTLMSSP_NEGOTIATE_SEAL
+    if (ntlmChallenge['flags'] & ntlm.NTLMSSP_NEGOTIATE_SIGN) == 0:
+        # No sign available, taking it out
+        responseFlags &= 0xffffffff ^ ntlm.NTLMSSP_NEGOTIATE_SIGN
+    if (ntlmChallenge['flags'] & ntlm.NTLMSSP_NEGOTIATE_ALWAYS_SIGN) == 0:
+        # No sign available, taking it out
+        responseFlags &= 0xffffffff ^ ntlm.NTLMSSP_NEGOTIATE_ALWAYS_SIGN
+
+    keyExchangeKey = ntlm.KXKEY(ntlmChallenge['flags'], sessionBaseKey, lmChallengeResponse,
+                           ntlmChallenge['challenge'], '',
+                           lmhash, nthash, True)
+
+    # If we set up key exchange, let's fill the right variables
+    if ntlmChallenge['flags'] & ntlm.NTLMSSP_NEGOTIATE_KEY_EXCH:
+        exportedSessionKey = authenticateMessage['session_key']
+        exportedSessionKey = ntlm.generateEncryptedSessionKey(keyExchangeKey, exportedSessionKey)
+    else:
+        encryptedRandomSessionKey = None
+        # [MS-NLMP] page 46
+        exportedSessionKey = keyExchangeKey
+
+    # Do they match?
+    if ntProofStr == ntProofStr2:
+        # Yes!, process login
+        return STATUS_SUCCESS, exportedSessionKey
+    else:
+        return STATUS_LOGON_FAILURE, exportedSessionKey
+
 
 def outputToJohnFormat(challenge, username, domain, lmresponse, ntresponse):
 # We don't want to add a possible failure here, since this is an
@@ -73,8 +136,17 @@ def outputToJohnFormat(challenge, username, domain, lmresponse, ntresponse):
             # NTLMv1
             ret_value = {'hash_string':'%s::%s:%s:%s:%s' % (username.decode('utf-16le'), domain.decode('utf-16le'), hexlify(lmresponse), hexlify(ntresponse), hexlify(challenge)), 'hash_version':'ntlm'}
     except:
-        #TODO: log some information about the error
-        pass
+        # Let's try w/o decoding Unicode
+        try:
+            if len(ntresponse) > 24:
+                # Extended Security - NTLMv2
+                ret_value = {'hash_string':'%s::%s:%s:%s:%s' % (username, domain, hexlify(challenge), hexlify(ntresponse)[:32], hexlify(ntresponse)[32:]), 'hash_version':'ntlmv2'}
+            else:
+                # NTLMv1
+                ret_value = {'hash_string':'%s::%s:%s:%s:%s' % (username, domain, hexlify(lmresponse), hexlify(ntresponse), hexlify(challenge)), 'hash_version':'ntlm'}
+        except Exception, e:
+            LOG.error("outputToJohnFormat: %s" % e)
+            pass
 
     return ret_value
 
@@ -144,7 +216,7 @@ def searchShare(connId, share, smbServer):
 def openFile(path,fileName, accessMode, fileAttributes, openMode):
     fileName = os.path.normpath(fileName.replace('\\','/'))
     errorCode = 0
-    if len(fileName) > 0 and fileName[0] == '/':
+    if len(fileName) > 0 and (fileName[0] == '/' or fileName[0] == '\\'):
        # strip leading '/'
        fileName = fileName[1:]
     pathName = os.path.join(path,fileName)
@@ -192,7 +264,7 @@ def queryFsInformation(path, filename, level=0):
          flags    = 0
 
     fileName = os.path.normpath(filename.replace('\\','/'))
-    if len(fileName) > 0 and fileName[0] == '/':
+    if len(fileName) > 0 and (fileName[0] == '/' or fileName[0] == '\\'):
        # strip leading '/'
        fileName = fileName[1:]
     pathName = os.path.join(path,fileName)
@@ -246,7 +318,7 @@ def findFirst2(path, fileName, level, searchAttributes, isSMB2 = False):
          encoding = 'ascii'
          flags    = 0
 
-     if len(fileName) > 0 and fileName[0] == '/':
+     if len(fileName) > 0 and (fileName[0] == '/' or fileName[0] == '\\'):
         # strip leading '/'
         fileName = fileName[1:]
 
@@ -368,7 +440,7 @@ def queryPathInformation(path, filename, level):
   try:
     errorCode = 0
     fileName = os.path.normpath(filename.replace('\\','/'))
-    if len(fileName) > 0 and fileName[0] == '/' and path != '':
+    if len(fileName) > 0 and (fileName[0] == '/' or fileName[0] == '\\') and path != '':
        # strip leading '/'
        fileName = fileName[1:]
     pathName = os.path.join(path,fileName)
@@ -562,7 +634,7 @@ class TRANS2Commands:
             path     = connData['ConnectedShares'][recvPacket['Tid']]['path']
             fileName = decodeSMBString(recvPacket['Flags2'], setPathInfoParameters['FileName'])
             fileName = os.path.normpath(fileName.replace('\\','/'))
-            if len(fileName) > 0 and fileName[0] == '/' and path != '':
+            if len(fileName) > 0 and (fileName[0] == '/' or fileName[0] == '\\') and path != '':
                # strip leading '/'
                fileName = fileName[1:]
             pathName = os.path.join(path,fileName)
@@ -1397,7 +1469,7 @@ class SMBCommands:
              path = connData['ConnectedShares'][recvPacket['Tid']]['path']
              fileName = os.path.normpath(decodeSMBString(recvPacket['Flags2'],comCreateDirectoryData['DirectoryName']).replace('\\','/'))
              if len(fileName) > 0:
-                if fileName[0] == '/':
+                if fileName[0] == '/' or fileName[0] == '\\':
                     # strip leading '/'
                     fileName = fileName[1:]
              pathName = os.path.join(path,fileName)
@@ -1441,11 +1513,11 @@ class SMBCommands:
              path = connData['ConnectedShares'][recvPacket['Tid']]['path']
              oldFileName = os.path.normpath(decodeSMBString(recvPacket['Flags2'],comRenameData['OldFileName']).replace('\\','/'))
              newFileName = os.path.normpath(decodeSMBString(recvPacket['Flags2'],comRenameData['NewFileName']).replace('\\','/'))
-             if len(oldFileName) > 0 and oldFileName[0] == '/':
+             if len(oldFileName) > 0 and (oldFileName[0] == '/' or oldFileName[0] == '\\'):
                 # strip leading '/'
                 oldFileName = oldFileName[1:]
              oldPathName = os.path.join(path,oldFileName)
-             if len(newFileName) > 0 and newFileName[0] == '/':
+             if len(newFileName) > 0 and (newFileName[0] == '/' or newFileName[0] == '\\'):
                 # strip leading '/'
                 newFileName = newFileName[1:]
              newPathName = os.path.join(path,newFileName)
@@ -1490,7 +1562,7 @@ class SMBCommands:
              errorCode = STATUS_SUCCESS
              path = connData['ConnectedShares'][recvPacket['Tid']]['path']
              fileName = os.path.normpath(decodeSMBString(recvPacket['Flags2'],comDeleteData['FileName']).replace('\\','/'))
-             if len(fileName) > 0 and fileName[0] == '/':
+             if len(fileName) > 0 and (fileName[0] == '/' or fileName[0] == '\\'):
                 # strip leading '/'
                 fileName = fileName[1:]
              pathName = os.path.join(path,fileName)
@@ -1534,7 +1606,7 @@ class SMBCommands:
              errorCode = STATUS_SUCCESS
              path = connData['ConnectedShares'][recvPacket['Tid']]['path']
              fileName = os.path.normpath(decodeSMBString(recvPacket['Flags2'],comDeleteDirectoryData['DirectoryName']).replace('\\','/'))
-             if len(fileName) > 0 and fileName[0] == '/':
+             if len(fileName) > 0 and (fileName[0] == '/' or fileName[0] == '\\'):
                 # strip leading '/'
                 fileName = fileName[1:]
              pathName = os.path.join(path,fileName)
@@ -1912,7 +1984,7 @@ class SMBCommands:
              deleteOnClose = False
 
              fileName = os.path.normpath(decodeSMBString(recvPacket['Flags2'],ntCreateAndXData['FileName']).replace('\\','/'))
-             if len(fileName) > 0 and fileName[0] == '/':
+             if len(fileName) > 0 and (fileName[0] == '/' or fileName[0] == '\\'):
                 # strip leading '/'
                 fileName = fileName[1:]
              pathName = os.path.join(path,fileName)
@@ -2180,6 +2252,10 @@ class SMBCommands:
 
         resp['Uid'] = connData['Uid']
         resp.addCommand(respSMBCommand)
+
+        # Sign the packet if needed
+        if connData['SignatureEnabled']:
+            smbServer.signSMBv1(connData, resp, connData['SigningSessionKey'], connData['SigningChallengeResponse'])
         smbServer.setConnectionData(connId, connData)
 
         return None, [resp], errorCode
@@ -2257,20 +2333,20 @@ class SMBCommands:
 
                 ansFlags = 0
 
-                if negotiateMessage['flags'] & ntlm.NTLMSSP_KEY_56:
-                   ansFlags |= ntlm.NTLMSSP_KEY_56
-                if negotiateMessage['flags'] & ntlm.NTLMSSP_KEY_128:
-                   ansFlags |= ntlm.NTLMSSP_KEY_128
-                if negotiateMessage['flags'] & ntlm.NTLMSSP_KEY_EXCHANGE:
-                   ansFlags |= ntlm.NTLMSSP_KEY_EXCHANGE
-                if negotiateMessage['flags'] & ntlm.NTLMSSP_NTLM2_KEY:
-                   ansFlags |= ntlm.NTLMSSP_NTLM2_KEY
-                if negotiateMessage['flags'] & ntlm.NTLMSSP_UNICODE:
-                   ansFlags |= ntlm.NTLMSSP_UNICODE
-                if negotiateMessage['flags'] & ntlm.NTLMSSP_OEM:
-                   ansFlags |= ntlm.NTLMSSP_OEM
+                if negotiateMessage['flags'] & ntlm.NTLMSSP_NEGOTIATE_56:
+                   ansFlags |= ntlm.NTLMSSP_NEGOTIATE_56
+                if negotiateMessage['flags'] & ntlm.NTLMSSP_NEGOTIATE_128:
+                   ansFlags |= ntlm.NTLMSSP_NEGOTIATE_128
+                if negotiateMessage['flags'] & ntlm.NTLMSSP_NEGOTIATE_KEY_EXCH:
+                   ansFlags |= ntlm.NTLMSSP_NEGOTIATE_KEY_EXCH
+                if negotiateMessage['flags'] & ntlm.NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY:
+                   ansFlags |= ntlm.NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY
+                if negotiateMessage['flags'] & ntlm.NTLMSSP_NEGOTIATE_UNICODE:
+                   ansFlags |= ntlm.NTLMSSP_NEGOTIATE_UNICODE
+                if negotiateMessage['flags'] & ntlm.NTLM_NEGOTIATE_OEM:
+                   ansFlags |= ntlm.NTLM_NEGOTIATE_OEM
 
-                ansFlags |= ntlm.NTLMSSP_VERSION | ntlm.NTLMSSP_TARGET_INFO | ntlm.NTLMSSP_TARGET_TYPE_SERVER | ntlm.NTLMSSP_NTLM_KEY | ntlm.NTLMSSP_TARGET
+                ansFlags |= ntlm.NTLMSSP_NEGOTIATE_VERSION | ntlm.NTLMSSP_NEGOTIATE_TARGET_INFO | ntlm.NTLMSSP_TARGET_TYPE_SERVER | ntlm.NTLMSSP_NEGOTIATE_NTLM | ntlm.NTLMSSP_REQUEST_TARGET
 
                 # Generate the AV_PAIRS
                 av_pairs = ntlm.AV_PAIRS()
@@ -2321,25 +2397,48 @@ class SMBCommands:
                 authenticateMessage = ntlm.NTLMAuthChallengeResponse()
                 authenticateMessage.fromString(token)
                 smbServer.log("AUTHENTICATE_MESSAGE (%s\\%s,%s)" % (authenticateMessage['domain_name'], authenticateMessage['user_name'], authenticateMessage['host_name']))
-                # TODO: Check the credentials! Now granting permissions
+                # Do we have credentials to check?
+                if len(smbServer.getCredentials()) > 0:
+                    identity = authenticateMessage['user_name'].decode('utf-16le')
+                    # Do we have this user's credentials?
+                    if smbServer.getCredentials().has_key(identity):
+                        # Process data:
+                        # Let's parse some data and keep it to ourselves in case it is asked
+                        uid, lmhash, nthash = smbServer.getCredentials()[identity]
 
-                respToken = SPNEGO_NegTokenResp()
-                # accept-completed
-                respToken['NegResult'] = '\x00'
+                        errorCode, sessionKey = computeNTLMv2(identity, lmhash, nthash, smbServer.getSMBChallenge(),
+                                             authenticateMessage, connData['CHALLENGE_MESSAGE'], connData['NEGOTIATE_MESSAGE'])
 
-                # Status SUCCESS
-                errorCode = STATUS_SUCCESS
-                smbServer.log('User %s\\%s authenticated successfully' % (authenticateMessage['user_name'], authenticateMessage['host_name']))
-                # Let's store it in the connection data
-                connData['AUTHENTICATE_MESSAGE'] = authenticateMessage
-                try:
-                    jtr_dump_path = smbServer.getJTRdumpPath()
-                    ntlm_hash_data = outputToJohnFormat( connData['CHALLENGE_MESSAGE']['challenge'], authenticateMessage['user_name'], authenticateMessage['domain_name'], authenticateMessage['lanman'], authenticateMessage['ntlm'] )
-                    smbServer.log(ntlm_hash_data['hash_string'])
-                    if jtr_dump_path is not '':
-                        writeJohnOutputToFile(ntlm_hash_data['hash_string'], ntlm_hash_data['hash_version'], jtr_dump_path)
-                except:
-                    smbServer.log("Could not write NTLM Hashes to the specified JTR_Dump_Path %s" % jtr_dump_path)
+                        if sessionKey is not None:
+                            connData['SignatureEnabled'] = False
+                            connData['SigningSessionKey'] = sessionKey
+                            connData['SignSequenceNumber'] = 1
+                    else:
+                        errorCode = STATUS_LOGON_FAILURE
+                else:
+                    # No credentials provided, let's grant access
+                    errorCode = STATUS_SUCCESS
+
+                if errorCode == STATUS_SUCCESS:
+                    respToken = SPNEGO_NegTokenResp()
+                    # accept-completed
+                    respToken['NegResult'] = '\x00'
+
+                    smbServer.log('User %s\\%s authenticated successfully' % (authenticateMessage['user_name'], authenticateMessage['host_name']))
+                    # Let's store it in the connection data
+                    connData['AUTHENTICATE_MESSAGE'] = authenticateMessage
+                    try:
+                        jtr_dump_path = smbServer.getJTRdumpPath()
+                        ntlm_hash_data = outputToJohnFormat( connData['CHALLENGE_MESSAGE']['challenge'], authenticateMessage['user_name'], authenticateMessage['domain_name'], authenticateMessage['lanman'], authenticateMessage['ntlm'] )
+                        smbServer.log(ntlm_hash_data['hash_string'])
+                        if jtr_dump_path is not '':
+                            writeJohnOutputToFile(ntlm_hash_data['hash_string'], ntlm_hash_data['hash_version'], jtr_dump_path)
+                    except:
+                        smbServer.log("Could not write NTLM Hashes to the specified JTR_Dump_Path %s" % jtr_dump_path)
+                else:
+                    respToken = SPNEGO_NegTokenResp()
+                    respToken['NegResult'] = '\x02'
+                    smbServer.log("Could not authenticate user!")
             else:
                 raise Exception("Unknown NTLMSSP MessageType %d" % messageType)
 
@@ -2439,6 +2538,7 @@ class SMBCommands:
                   _dialects_parameters['Capabilities'] |= smb.SMB.CAP_RPC_REMOTE_APIS
 
            _dialects_parameters['DialectIndex']    = index
+           #_dialects_parameters['SecurityMode']    = smb.SMB.SECURITY_AUTH_ENCRYPTED | smb.SMB.SECURITY_SHARE_USER | smb.SMB.SECURITY_SIGNATURES_REQUIRED
            _dialects_parameters['SecurityMode']    = smb.SMB.SECURITY_AUTH_ENCRYPTED | smb.SMB.SECURITY_SHARE_USER
            _dialects_parameters['MaxMpxCount']     = 1
            _dialects_parameters['MaxNumberVcs']    = 1
@@ -2600,20 +2700,20 @@ class SMB2Commands:
 
             ansFlags = 0
 
-            if negotiateMessage['flags'] & ntlm.NTLMSSP_KEY_56:
-               ansFlags |= ntlm.NTLMSSP_KEY_56
-            if negotiateMessage['flags'] & ntlm.NTLMSSP_KEY_128:
-               ansFlags |= ntlm.NTLMSSP_KEY_128
-            if negotiateMessage['flags'] & ntlm.NTLMSSP_KEY_EXCHANGE:
-               ansFlags |= ntlm.NTLMSSP_KEY_EXCHANGE
-            if negotiateMessage['flags'] & ntlm.NTLMSSP_NTLM2_KEY:
-               ansFlags |= ntlm.NTLMSSP_NTLM2_KEY
-            if negotiateMessage['flags'] & ntlm.NTLMSSP_UNICODE:
-               ansFlags |= ntlm.NTLMSSP_UNICODE
-            if negotiateMessage['flags'] & ntlm.NTLMSSP_OEM:
-               ansFlags |= ntlm.NTLMSSP_OEM
+            if negotiateMessage['flags'] & ntlm.NTLMSSP_NEGOTIATE_56:
+               ansFlags |= ntlm.NTLMSSP_NEGOTIATE_56
+            if negotiateMessage['flags'] & ntlm.NTLMSSP_NEGOTIATE_128:
+               ansFlags |= ntlm.NTLMSSP_NEGOTIATE_128
+            if negotiateMessage['flags'] & ntlm.NTLMSSP_NEGOTIATE_KEY_EXCH:
+               ansFlags |= ntlm.NTLMSSP_NEGOTIATE_KEY_EXCH
+            if negotiateMessage['flags'] & ntlm.NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY:
+               ansFlags |= ntlm.NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY
+            if negotiateMessage['flags'] & ntlm.NTLMSSP_NEGOTIATE_UNICODE:
+               ansFlags |= ntlm.NTLMSSP_NEGOTIATE_UNICODE
+            if negotiateMessage['flags'] & ntlm.NTLM_NEGOTIATE_OEM:
+               ansFlags |= ntlm.NTLM_NEGOTIATE_OEM
 
-            ansFlags |= ntlm.NTLMSSP_VERSION | ntlm.NTLMSSP_TARGET_INFO | ntlm.NTLMSSP_TARGET_TYPE_SERVER | ntlm.NTLMSSP_NTLM_KEY | ntlm.NTLMSSP_TARGET
+            ansFlags |= ntlm.NTLMSSP_NEGOTIATE_VERSION | ntlm.NTLMSSP_NEGOTIATE_TARGET_INFO | ntlm.NTLMSSP_TARGET_TYPE_SERVER | ntlm.NTLMSSP_NEGOTIATE_NTLM | ntlm.NTLMSSP_REQUEST_TARGET
 
             # Generate the AV_PAIRS
             av_pairs = ntlm.AV_PAIRS()
@@ -2665,25 +2765,59 @@ class SMB2Commands:
             authenticateMessage.fromString(token)
             smbServer.log("AUTHENTICATE_MESSAGE (%s\\%s,%s)" % (authenticateMessage['domain_name'], authenticateMessage['user_name'], authenticateMessage['host_name']))
             # TODO: Check the credentials! Now granting permissions
+            # Do we have credentials to check?
+            if len(smbServer.getCredentials()) > 0:
+                isGuest = False
+                identity = authenticateMessage['user_name'].decode('utf-16le')
+                # Do we have this user's credentials?
+                if smbServer.getCredentials().has_key(identity):
+                    # Process data:
+                    # Let's parse some data and keep it to ourselves in case it is asked
+                    uid, lmhash, nthash = smbServer.getCredentials()[identity]
 
-            respToken = SPNEGO_NegTokenResp()
-            # accept-completed
-            respToken['NegResult'] = '\x00'
+                    errorCode, sessionKey = computeNTLMv2(identity, lmhash, nthash, smbServer.getSMBChallenge(),
+                                                          authenticateMessage, connData['CHALLENGE_MESSAGE'],
+                                                          connData['NEGOTIATE_MESSAGE'])
 
-            # Status SUCCESS
-            errorCode = STATUS_SUCCESS
-            smbServer.log('User %s\\%s authenticated successfully' % (authenticateMessage['user_name'], authenticateMessage['host_name']))
-            # Let's store it in the connection data
-            connData['AUTHENTICATE_MESSAGE'] = authenticateMessage
-            try:
-                jtr_dump_path = smbServer.getJTRdumpPath()
-                ntlm_hash_data = outputToJohnFormat( connData['CHALLENGE_MESSAGE']['challenge'], authenticateMessage['user_name'], authenticateMessage['domain_name'], authenticateMessage['lanman'], authenticateMessage['ntlm'] )
-                smbServer.log(ntlm_hash_data['hash_string'])
-                if jtr_dump_path is not '':
-                    writeJohnOutputToFile(ntlm_hash_data['hash_string'], ntlm_hash_data['hash_version'], jtr_dump_path)
-            except:
-                smbServer.log("Could not write NTLM Hashes to the specified JTR_Dump_Path %s" % jtr_dump_path)
-            respSMBCommand['SessionFlags'] = 1
+                    if sessionKey is not None:
+                        connData['SignatureEnabled'] = True
+                        connData['SigningSessionKey'] = sessionKey
+                        connData['SignSequenceNumber'] = 1
+                else:
+                    errorCode = STATUS_LOGON_FAILURE
+            else:
+                # No credentials provided, let's grant access
+                isGuest = True
+                errorCode = STATUS_SUCCESS
+
+            if errorCode == STATUS_SUCCESS:
+                respToken = SPNEGO_NegTokenResp()
+                # accept-completed
+                respToken['NegResult'] = '\x00'
+                smbServer.log('User %s\\%s authenticated successfully' % (
+                authenticateMessage['user_name'], authenticateMessage['host_name']))
+                # Let's store it in the connection data
+                connData['AUTHENTICATE_MESSAGE'] = authenticateMessage
+                try:
+                    jtr_dump_path = smbServer.getJTRdumpPath()
+                    ntlm_hash_data = outputToJohnFormat(connData['CHALLENGE_MESSAGE']['challenge'],
+                                                        authenticateMessage['user_name'],
+                                                        authenticateMessage['domain_name'],
+                                                        authenticateMessage['lanman'], authenticateMessage['ntlm'])
+                    smbServer.log(ntlm_hash_data['hash_string'])
+                    if jtr_dump_path is not '':
+                        writeJohnOutputToFile(ntlm_hash_data['hash_string'], ntlm_hash_data['hash_version'],
+                                              jtr_dump_path)
+                except:
+                    smbServer.log("Could not write NTLM Hashes to the specified JTR_Dump_Path %s" % jtr_dump_path)
+
+                if isGuest:
+                    respSMBCommand['SessionFlags'] = 1
+
+            else:
+                respToken = SPNEGO_NegTokenResp()
+                respToken['NegResult'] = '\x02'
+                smbServer.log("Could not authenticate user!")
         else:
             raise Exception("Unknown NTLMSSP MessageType %d" % messageType)
 
@@ -2759,6 +2893,9 @@ class SMB2Commands:
 
         respPacket['Data'] = respSMBCommand
 
+        # Sign the packet if needed
+        if connData['SignatureEnabled']:
+            smbServer.signSMBv2(respPacket, connData['SigningSessionKey'])
         smbServer.setConnectionData(connId, connData)
 
         return None, [respPacket], errorCode
@@ -2785,7 +2922,7 @@ class SMB2Commands:
              deleteOnClose = False
 
              fileName = os.path.normpath(ntCreateRequest['Buffer'][:ntCreateRequest['NameLength']].decode('utf-16le').replace('\\','/'))
-             if len(fileName) > 0 and fileName[0] == '/':
+             if len(fileName) > 0 and (fileName[0] == '/' or fileName[0] == '\\'):
                 # strip leading '/'
                 fileName = fileName[1:]
              pathName = os.path.join(path,fileName)
@@ -3268,7 +3405,9 @@ class SMB2Commands:
         # If any other information class is specified in the FileInformationClass 
         # field of the SMB2 QUERY_DIRECTORY Request, the server MUST fail the 
         # operation with STATUS_INVALID_INFO_CLASS. 
-        if queryDirectoryRequest['FileInformationClass'] not in (smb2.FILE_DIRECTORY_INFORMATION,smb2.FILE_FULL_DIRECTORY_INFORMATION,smb2.FILEID_FULL_DIRECTORY_INFORMATION, smb2.FILE_BOTH_DIRECTORY_INFORMATION, smb2.FILEID_BOTH_DIRECTORY_INFORMATION, smb2.FILENAMES_INFORMATION):
+        if queryDirectoryRequest['FileInformationClass'] not in (
+        smb2.FILE_DIRECTORY_INFORMATION, smb2.FILE_FULL_DIRECTORY_INFORMATION, smb2.FILEID_FULL_DIRECTORY_INFORMATION,
+        smb2.FILE_BOTH_DIRECTORY_INFORMATION, smb2.FILEID_BOTH_DIRECTORY_INFORMATION, smb2.FILENAMES_INFORMATION):
             return [smb2.SMB2Error()], None, STATUS_INVALID_INFO_CLASS
 
         # If SMB2_REOPEN is set in the Flags field of the SMB2 QUERY_DIRECTORY 
@@ -3328,6 +3467,9 @@ class SMB2Commands:
         respData = ''
         for nItem in range(connData['OpenedFiles'][fileID]['Open']['EnumerationLocation'], searchCount):
             connData['OpenedFiles'][fileID]['Open']['EnumerationLocation'] += 1
+            if queryDirectoryRequest['Flags'] & smb2.SL_RETURN_SINGLE_ENTRY:
+                # If single entry is requested we must clear the NextEntryOffset
+                searchResult[nItem]['NextEntryOffset'] = 0
             data = searchResult[nItem].getData()
             lenData = len(data)
             padLen = (8-(lenData % 8)) %8
@@ -3488,19 +3630,21 @@ class Ioctls:
         errorCode = STATUS_SUCCESS
 
         validateNegotiateInfo = smb2.VALIDATE_NEGOTIATE_INFO(ioctlRequest['Buffer'])
-        validateNegotiateInfo['Capabilities'] = 0
-        validateNegotiateInfo['Guid'] = 'A'*16
-        validateNegotiateInfo['SecurityMode'] = 1
-        validateNegotiateInfo['Dialects'] = (smb2.SMB2_DIALECT_002,)
+        validateNegotiateInfoResponse = smb2.VALIDATE_NEGOTIATE_INFO_RESPONSE()
+        validateNegotiateInfoResponse['Capabilities'] = 0
+        validateNegotiateInfoResponse['Guid'] = 'A'*16
+        validateNegotiateInfoResponse['SecurityMode'] = 1
+        validateNegotiateInfoResponse['Dialect'] = smb2.SMB2_DIALECT_002
 
         smbServer.setConnectionData(connId, connData)
-        return validateNegotiateInfo.getData(), errorCode
+        return validateNegotiateInfoResponse.getData(), errorCode
 
 
 class SMBSERVERHandler(SocketServer.BaseRequestHandler):
     def __init__(self, request, client_address, server, select_poll = False):
         self.__SMB = server
-        self.__ip, self.__port = client_address
+        # In case of AF_INET6 the client_address contains 4 items, ignore the last 2
+        self.__ip, self.__port = client_address[:2]
         self.__request = request
         self.__connId = threading.currentThread().getName()
         self.__timeOut = 60*5
@@ -3709,6 +3853,9 @@ smb.SMB.TRANS_TRANSACT_NMPIPE          :self.__smbTransHandler.transactNamedPipe
         # SID results for findfirst2
         self.__activeConnections[name]['SIDs']            = {}
         self.__activeConnections[name]['LastRequest']     = {}
+        self.__activeConnections[name]['SignatureEnabled']= False
+        self.__activeConnections[name]['SigningChallengeResponse']= ''
+        self.__activeConnections[name]['SigningSessionKey']= ''
 
     def getActiveConnections(self):
         return self.__activeConnections
@@ -3732,6 +3879,12 @@ smb.SMB.TRANS_TRANSACT_NMPIPE          :self.__smbTransHandler.transactNamedPipe
     def registerNamedPipe(self, pipeName, address):
         self.__registeredNamedPipes[unicode(pipeName)] = address
         return True
+
+    def unregisterNamedPipe(self, pipeName):
+        if self.__registeredNamedPipes.has_key(pipeName):
+            del(self.__registeredNamedPipes[unicode(pipeName)])
+            return True
+        return False
 
     def unregisterTransaction(self, transCommand):
         if self.__smbTransCommands.has_key(transCommand):
@@ -3897,6 +4050,44 @@ smb.SMB.TRANS_TRANSACT_NMPIPE          :self.__smbTransHandler.transactNamedPipe
         # returning False, closes the connection
         return True
 
+    def signSMBv1(self, connData, packet, signingSessionKey, signingChallengeResponse):
+        # This logic MUST be applied for messages sent in response to any of the higher-layer actions and in
+        # compliance with the message sequencing rules.
+        #  * The client or server that sends the message MUST provide the 32-bit sequence number for this
+        #    message, as specified in sections 3.2.4.1 and 3.3.4.1.
+        #  * The SMB_FLAGS2_SMB_SECURITY_SIGNATURE flag in the header MUST be set.
+        #  * To generate the signature, a 32-bit sequence number is copied into the
+        #    least significant 32 bits of the SecuritySignature field and the remaining
+        #    4 bytes are set to 0x00.
+        #  * The MD5 algorithm, as specified in [RFC1321], MUST be used to generate a hash of the SMB
+        #    message from the start of the SMB Header, which is defined as follows.
+        #    CALL MD5Init( md5context )
+        #    CALL MD5Update( md5context, Connection.SigningSessionKey )
+        #    CALL MD5Update( md5context, Connection.SigningChallengeResponse )
+        #    CALL MD5Update( md5context, SMB message )
+        #    CALL MD5Final( digest, md5context )
+        #    SET signature TO the first 8 bytes of the digest
+        # The resulting 8-byte signature MUST be copied into the SecuritySignature field of the SMB Header,
+        # after which the message can be transmitted.
+
+        #print "seq(%d) signingSessionKey %r, signingChallengeResponse %r" % (connData['SignSequenceNumber'], signingSessionKey, signingChallengeResponse)
+        packet['SecurityFeatures'] = struct.pack('<q',connData['SignSequenceNumber'])
+        # Sign with the sequence
+        m = hashlib.md5()
+        m.update( signingSessionKey )
+        m.update( signingChallengeResponse )
+        m.update( str(packet) )
+        # Replace sequence with acual hash
+        packet['SecurityFeatures'] = m.digest()[:8]
+        connData['SignSequenceNumber'] +=2
+
+    def signSMBv2(self, packet, signingSessionKey):
+        packet['Signature'] = '\x00'*16
+        packet['Flags'] |= smb2.SMB2_FLAGS_SIGNED
+        signature = hmac.new(signingSessionKey, str(packet), hashlib.sha256).digest()
+        packet['Signature'] = signature[:16]
+        #print "%s" % packet['Signature'].encode('hex')
+
     def processRequest(self, connId, data):
 
         # TODO: Process batched commands.
@@ -3908,6 +4099,8 @@ smb.SMB.TRANS_TRANSACT_NMPIPE          :self.__smbTransHandler.transactNamedPipe
         except:
             # Maybe a SMB2 packet?
             packet = smb2.SMB2Packet(data = data)
+            connData = self.getConnectionData(connId, False)
+            self.signSMBv2(packet, connData['SigningSessionKey'])
             isSMB2 = True
 
         # We might have compound requests
@@ -4058,6 +4251,10 @@ smb.SMB.TRANS_TRANSACT_NMPIPE          :self.__smbTransHandler.transactNamedPipe
                         respPacket['_reserved']   = errorCode >> 8 & 0xff
                         respPacket['ErrorClass']  = errorCode & 0xff
                         respPacket.addCommand(respCommand)
+
+                        if connData['SignatureEnabled']:
+                            respPacket['Flags2'] |= smb.SMB.FLAGS2_SMB_SECURITY_SIGNATURE
+                            self.signSMBv1(connData, respPacket, connData['SigningSessionKey'], connData['SigningChallengeResponse'])
             
                         packetsToSend.append(respPacket)
                     else:
@@ -4075,6 +4272,10 @@ smb.SMB.TRANS_TRANSACT_NMPIPE          :self.__smbTransHandler.transactNamedPipe
                         respPacket['MessageID'] = packet['MessageID']
                         respPacket['TreeID']    = packet['TreeID']
                         respPacket['Data']      = str(respCommand)
+
+                        if connData['SignatureEnabled']:
+                            self.signSMBv2(respPacket, connData['SigningSessionKey'])
+
                         packetsToSend.append(respPacket)
             else:
                 # The SMBCommand took care of building the packet
@@ -4138,11 +4339,23 @@ smb.SMB.TRANS_TRANSACT_NMPIPE          :self.__smbTransHandler.transactNamedPipe
             cred = open(credentials_fname)
             line = cred.readline()
             while line:
-                name, domain, lmhash, nthash = line.split(':')
-                self.__credentials[name] = (domain, lmhash, nthash.strip('\r\n'))
+                name, uid, lmhash, nthash = line.split(':')
+                self.__credentials[name] = (uid, lmhash, nthash.strip('\r\n'))
                 line = cred.readline()
             cred.close()
-        self.log('Config file parsed')     
+        self.log('Config file parsed')
+
+    def addCredential(self, name, uid, lmhash, nthash):
+        # If we have hashes, normalize them
+        if lmhash != '' or nthash != '':
+            if len(lmhash) % 2:     lmhash = '0%s' % lmhash
+            if len(nthash) % 2:     nthash = '0%s' % nthash
+            try: # just in case they were converted already
+                lmhash = a2b_hex(lmhash)
+                nthash = a2b_hex(nthash)
+            except:
+                pass
+        self.__credentials[name] = (uid, lmhash, nthash)
 
 # For windows platforms, opening a directory is not an option, so we set a void FD
 VOID_FILE_DESCRIPTOR = -1
@@ -4343,6 +4556,15 @@ class SimpleSMBServer:
         self.__wkstServer.start()
         self.__server.serve_forever()
 
+    def registerNamedPipe(self, pipeName, address):
+        return self.__server.registerNamedPipe(pipeName, address)
+
+    def unregisterNamedPipe(self, pipeName):
+        return self.__server.unregisterNamedPipe(pipeName)
+
+    def getRegisteredNamedPipes(self):
+        return self.__server.getRegisteredNamedPipes()
+
     def addShare(self, shareName, sharePath, shareComment='', shareType = 0, readOnly = 'no'):
         self.__smbConfig.add_section(shareName)
         self.__smbConfig.set(shareName, 'comment', shareComment)
@@ -4376,6 +4598,9 @@ class SimpleSMBServer:
         self.__smbConfig.set('global','credentials_file',logFile)
         self.__server.setServerConfig(self.__smbConfig)
         self.__server.processConfigFile()
+
+    def addCredential(self, name, uid, lmhash, nthash):
+        self.__server.addCredential(name, uid, lmhash, nthash)
 
     def setSMB2Support(self, value):
         if value is True:

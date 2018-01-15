@@ -1,10 +1,14 @@
 import unittest
 import os
+import socket
+import select
+import errno
 
+import ConfigParser
 from binascii import unhexlify
 from impacket.smbconnection import SMBConnection, smb
 from impacket.smb3structs import *
-
+from impacket import nt_errors
 
 # IMPORTANT NOTE:
 # For some reason, under Windows 8, you cannot switch between
@@ -20,11 +24,37 @@ class SMBTests(unittest.TestCase):
     def create_connection(self):
         if self.dialects == smb.SMB_DIALECT:
             # Only for SMB1 let's do manualNego
-            s = SMBConnection('*SMBSERVER', self.machine, preferredDialect = self.dialects, manualNegotiate=True)
+            s = SMBConnection(self.serverName, self.machine, preferredDialect = self.dialects, manualNegotiate=True)
             s.negotiateSession(self.dialects, flags2=self.flags2)
         else:
-            s = SMBConnection('*SMBSERVER', self.machine, preferredDialect = self.dialects)
+            s = SMBConnection(self.serverName, self.machine, preferredDialect = self.dialects)
         return s
+
+    def test_reconnect(self):
+        smb = self.create_connection()
+        smb.login(self.username, self.password, self.domain)
+        smb.listPath(self.share, '*')
+        smb.logoff()
+        smb.reconnect()
+        smb.listPath(self.share, '*')
+        smb.logoff()
+
+    def test_reconnectKerberosHashes(self):
+        lmhash, nthash = self.hashes.split(':')
+        smb = self.create_connection()
+        smb.kerberosLogin(self.username, '', self.domain, lmhash, nthash, '')
+        credentials = smb.getCredentials()
+        self.assertTrue( credentials == (self.username, '', self.domain, unhexlify(lmhash), unhexlify(nthash), '', None, None) )
+        UNC = '\\\\%s\\%s' % (self.machine, self.share)
+        tid = smb.connectTree(UNC)
+        smb.logoff()
+        smb.reconnect()
+        credentials = smb.getCredentials()
+        self.assertTrue(
+            credentials == (self.username, '', self.domain, unhexlify(lmhash), unhexlify(nthash), '', None, None))
+        UNC = '\\\\%s\\%s' % (self.machine, self.share)
+        tid = smb.connectTree(UNC)
+        smb.logoff()
 
     def test_connectTree(self):
         smb = self.create_connection()
@@ -39,6 +69,15 @@ class SMBTests(unittest.TestCase):
         credentials = smb.getCredentials()
         self.assertTrue( credentials == (self.username, self.password, self.domain, '','','', None, None))
         smb.logoff()
+        del(smb)
+        
+    def test_close_connection(self):
+        smb = self.create_connection()
+        smb.login(self.username, self.password, self.domain)
+        smb_connection_socket = smb.getSMBServer().get_socket()
+        self.assertTrue(self.__is_socket_opened(smb_connection_socket) == True)
+        smb.close()
+        self.assertTrue(self.__is_socket_opened(smb_connection_socket) == False)
         del(smb)
 
     def test_manualNego(self):
@@ -109,7 +148,13 @@ class SMBTests(unittest.TestCase):
         tid = smb.connectTree(self.share)
         fid = smb.createFile(tid, self.file)
         smb.writeFile(tid, fid, "A"*65535)
-        data = smb.readFile(tid,fid, 0, 65535)
+        finished = False
+        data = ''
+        offset = 0
+        remaining = 65535
+        while remaining>0:
+            data += smb.readFile(tid,fid, offset, remaining)
+            remaining = 65535 - len(data)
         self.assertTrue(len(data) == 65535)
         self.assertTrue(data == "A"*65535)
         smb.closeFile(tid,fid)
@@ -124,7 +169,16 @@ class SMBTests(unittest.TestCase):
         smb = self.create_connection()
         smb.login(self.username, self.password, self.domain)
         smb.createDirectory(self.share, self.directory)
-        smb.deleteDirectory(self.share, self.directory) 
+        smb.deleteDirectory(self.share, self.directory)
+        smb.createDirectory(self.share, self.directory)
+        nested_dir = "%s\\%s" %(self.directory, self.directory)
+        smb.createDirectory(self.share, nested_dir)
+        try:
+            smb.deleteDirectory(self.share, self.directory)
+        except Exception as e:
+            if e.error == nt_errors.STATUS_DIRECTORY_NOT_EMPTY:
+                smb.deleteDirectory(self.share, nested_dir)
+                smb.deleteDirectory(self.share, self.directory)
         smb.logoff()
  
     def test_getData(self):
@@ -143,7 +197,7 @@ class SMBTests(unittest.TestCase):
         smb = self.create_connection()
         smb.login(self.username, self.password, self.domain)
         serverName = smb.getServerName()
-        self.assertTrue( serverName == self.serverName )
+        self.assertTrue( serverName.upper() == self.serverName.upper() )
         smb.logoff()
 
     def test_getServerDNSDomainName(self):
@@ -199,18 +253,30 @@ class SMBTests(unittest.TestCase):
         smb.getSessionKey()
         smb.logoff
         
+    def __is_socket_opened(self, s):
+        # We assume that if socket is selectable, it's open; and if it were not, it's closed.
+        # Note: this method is accurate as long as the file descriptor used for the socket is not re-used
+        is_socket_opened = True 
+        try:
+            select.select([s], [], [], 0)
+        except socket.error, e:
+            if e[0] == errno.EBADF:
+                is_socket_opened = False
+        return is_socket_opened
 
 class SMB1Tests(SMBTests):
     def setUp(self):
         SMBTests.setUp(self)
         # Put specific configuration for target machine with SMB1
-        self.username = 'Administrator'
-        self.domain   = 'FREEFLY'
-        self.serverName = 'ULTIMATE64'
-        self.password = 'Admin123456'
-        self.hashes   = 'aad3b435b51404eeaad3b435b51404ee:ae4c0d5fb959fda8f4cb1d14a8376af4'
-        self.aesKey   = ''
-        self.machine  = '192.168.88.105'
+        configFile = ConfigParser.ConfigParser()
+        configFile.read('dcetests.cfg')
+        self.username = configFile.get('SMBTransport', 'username')
+        self.domain   = configFile.get('SMBTransport', 'domain')
+        self.serverName = configFile.get('SMBTransport', 'servername')
+        self.password = configFile.get('SMBTransport', 'password')
+        self.machine  = configFile.get('SMBTransport', 'machine')
+        self.hashes   = configFile.get('SMBTransport', 'hashes')
+        self.aesKey   = configFile.get('SMBTransport', 'aesKey128')
         self.share    = 'C$'
         self.file     = '/TEST'
         self.directory= '/BETO'
@@ -222,13 +288,15 @@ class SMB1TestsUnicode(SMBTests):
     def setUp(self):
         SMBTests.setUp(self)
         # Put specific configuration for target machine with SMB1
-        self.username = 'Administrator'
-        self.domain   = 'FREEFLY'
-        self.serverName = 'ULTIMATE64'
-        self.password = 'Admin123456'
-        self.hashes   = 'aad3b435b51404eeaad3b435b51404ee:ae4c0d5fb959fda8f4cb1d14a8376af4'
-        self.aesKey   = ''
-        self.machine  = '192.168.88.105'
+        configFile = ConfigParser.ConfigParser()
+        configFile.read('dcetests.cfg')
+        self.username = configFile.get('SMBTransport', 'username')
+        self.domain   = configFile.get('SMBTransport', 'domain')
+        self.serverName = configFile.get('SMBTransport', 'servername')
+        self.password = configFile.get('SMBTransport', 'password')
+        self.machine  = configFile.get('SMBTransport', 'machine')
+        self.hashes   = configFile.get('SMBTransport', 'hashes')
+        self.aesKey   = configFile.get('SMBTransport', 'aesKey128')
         self.share    = 'C$'
         self.file     = '/TEST'
         self.directory= '/BETO'
@@ -240,13 +308,15 @@ class SMB002Tests(SMBTests):
     def setUp(self):
         # Put specific configuration for target machine with SMB_002
         SMBTests.setUp(self)
-        self.username = 'Administrator'
-        self.domain   = 'FREEFLY'
-        self.serverName = 'ULTIMATE64'
-        self.password = 'Admin123456'
-        self.hashes   = 'aad3b435b51404eeaad3b435b51404ee:ae4c0d5fb959fda8f4cb1d14a8376af4'
-        self.aesKey   = ''
-        self.machine  = '192.168.88.105'
+        configFile = ConfigParser.ConfigParser()
+        configFile.read('dcetests.cfg')
+        self.username = configFile.get('SMBTransport', 'username')
+        self.domain   = configFile.get('SMBTransport', 'domain')
+        self.serverName = configFile.get('SMBTransport', 'servername')
+        self.password = configFile.get('SMBTransport', 'password')
+        self.machine  = configFile.get('SMBTransport', 'machine')
+        self.hashes   = configFile.get('SMBTransport', 'hashes')
+        self.aesKey   = configFile.get('SMBTransport', 'aesKey128')
         self.share    = 'C$'
         self.file     = '/TEST'
         self.directory= '/BETO'
@@ -257,13 +327,15 @@ class SMB21Tests(SMBTests):
     def setUp(self):
         # Put specific configuration for target machine with SMB 2.1
         SMBTests.setUp(self)
-        self.username = 'Administrator'
-        self.domain   = 'FREEFLY'
-        self.serverName = 'ULTIMATE64'
-        self.password = 'Admin123456'
-        self.hashes   = 'aad3b435b51404eeaad3b435b51404ee:ae4c0d5fb959fda8f4cb1d14a8376af4'
-        self.aesKey   = ''
-        self.machine  = '192.168.88.105'
+        configFile = ConfigParser.ConfigParser()
+        configFile.read('dcetests.cfg')
+        self.username = configFile.get('SMBTransport', 'username')
+        self.domain   = configFile.get('SMBTransport', 'domain')
+        self.serverName = configFile.get('SMBTransport', 'servername')
+        self.password = configFile.get('SMBTransport', 'password')
+        self.machine  = configFile.get('SMBTransport', 'machine')
+        self.hashes   = configFile.get('SMBTransport', 'hashes')
+        self.aesKey   = configFile.get('SMBTransport', 'aesKey128')
         self.share    = 'C$'
         self.file     = '/TEST'
         self.directory= '/BETO'
@@ -274,13 +346,15 @@ class SMB3Tests(SMBTests):
     def setUp(self):
         # Put specific configuration for target machine with SMB3
         SMBTests.setUp(self)
-        self.username = 'admin'
-        self.domain   = ''
-        self.serverName = 'WINDOWS81'
-        self.password = 'admin'
-        self.hashes   = 'aad3b435b51404eeaad3b435b51404ee:209c6174da490caeb422f3fa5a7ae634'
-        self.aesKey   = ''
-        self.machine  = '192.168.88.114'
+        configFile = ConfigParser.ConfigParser()
+        configFile.read('dcetests.cfg')
+        self.username = configFile.get('SMBTransport', 'username')
+        self.domain   = configFile.get('SMBTransport', 'domain')
+        self.serverName = configFile.get('SMBTransport', 'servername')
+        self.password = configFile.get('SMBTransport', 'password')
+        self.machine  = configFile.get('SMBTransport', 'machine')
+        self.hashes   = configFile.get('SMBTransport', 'hashes')
+        self.aesKey   = configFile.get('SMBTransport', 'aesKey128')
         self.share    = 'C$'
         self.file     = '/TEST'
         self.directory= '/BETO'

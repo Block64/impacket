@@ -1,4 +1,4 @@
-# Copyright (c) 2003-2015 CORE Security Technologies)
+# Copyright (c) 2003-2016 CORE Security Technologies
 #
 # This software is provided under under a slightly modified version
 # of the Apache Software License. See the accompanying LICENSE file
@@ -20,7 +20,7 @@
 # [X] Implement SMB2_SET_INFO
 # [ ] Implement SMB2_OPLOCK_BREAK
 # [X] Implement SMB3 signing 
-# [ ] Implement SMB3 encryption
+# [X] Implement SMB3 encryption
 # [ ] Add more backward compatible commands from the smb.py code
 # [ ] Fix up all the 'ToDo' comments inside the code
 #
@@ -32,12 +32,14 @@ import string
 import struct
 from binascii import a2b_hex
 from contextlib import contextmanager
+from pyasn1.type.univ import noValue
 
 from impacket import nmb, ntlm, uuid, crypto, LOG
 from impacket.smb3structs import *
 from impacket.nt_errors import STATUS_SUCCESS, STATUS_MORE_PROCESSING_REQUIRED, STATUS_INVALID_PARAMETER, \
     STATUS_NO_MORE_FILES, STATUS_PENDING, STATUS_NOT_IMPLEMENTED, ERROR_MESSAGES
-from impacket.spnego import SPNEGO_NegTokenInit, TypesMech, SPNEGO_NegTokenResp
+from impacket.spnego import SPNEGO_NegTokenInit, TypesMech, SPNEGO_NegTokenResp, ASN1_OID, asn1encode, ASN1_AID
+from impacket.krb5.gssapi import KRB5_AP_REQ
 
 
 # For signing
@@ -116,13 +118,14 @@ class SessionError(Exception):
 
 
 class SMB3:
-    def __init__(self, remote_name, remote_host, my_name = None, host_type = nmb.TYPE_SERVER, sess_port = 445, timeout=60, UDP = 0, preferredDialect = None, session = None):
+    def __init__(self, remote_name, remote_host, my_name=None, host_type=nmb.TYPE_SERVER, sess_port=445, timeout=60,
+                 UDP=0, preferredDialect=None, session=None, negSessionResponse=None):
 
         # [MS-SMB2] Section 3
         self.RequireMessageSigning = False    #
         self.ConnectionTable = {}
         self.GlobalFileTable = {}
-        self.ClientGuid = ''                  #
+        self.ClientGuid = ''.join([random.choice(string.letters) for i in range(16)])
         # Only for SMB 3.0
         self.EncryptionAlgorithmList = ['AES-CCM']
         self.MaxDialect = []
@@ -145,7 +148,7 @@ class SMB3:
             'ServerName'               : '',    #
             # If the client implements the SMB 2.1 or SMB 3.0 dialects, it MUST 
             # also implement the following
-            'Dialect'                  : '',    #
+            'Dialect'                  : 0,    #
             'SupportsFileLeasing'      : False, #
             'SupportsMultiCredit'      : False, #
             # If the client implements the SMB 3.0 dialect, 
@@ -160,6 +163,7 @@ class SMB3:
             'ServerSecurityMode'       : 0,    #
             # Outside the protocol
             'ServerIP'                 : '',    #
+            'ClientName'               : '',    #
         }
    
         self._Session = {
@@ -194,6 +198,8 @@ class SMB3:
         self._timeout = timeout
         self._Connection['ServerIP'] = remote_host
         self._NetBIOSSession = None
+        self._preferredDialect = preferredDialect
+        self._doKerberos = False
 
         self.__userName = ''
         self.__password = ''
@@ -210,8 +216,15 @@ class SMB3:
         else:
            self._Connection['ServerName'] = remote_name
 
+        # This is on purpose. I'm still not convinced to do a socket.gethostname() if not specified
+        if my_name is None:
+            self._Connection['ClientName'] = ''
+        else:
+            self._Connection['ClientName'] = my_name
+
         if session is None:
             if not my_name:
+                # If destination port is 139 yes, there's some client disclosure
                 my_name = socket.gethostname()
                 i = string.find(my_name, '.')
                 if i > -1:
@@ -227,8 +240,8 @@ class SMB3:
             self._NetBIOSSession = session
             # We should increase the SequenceWindow since a packet was already received.
             self._Connection['SequenceWindow'] += 1
-            # Let's negotiate again using the same connection
-            self.negotiateSession(preferredDialect)
+            # Let's negotiate again if needed (or parse the existing response) using the same connection
+            self.negotiateSession(preferredDialect, negSessionResponse)
 
     def printStatus(self):
         print "CONNECTION"
@@ -239,8 +252,23 @@ class SMB3:
         for i in self._Session.items():
             print "%-40s : %s" % i
 
+    def getKerberos(self):
+        return self._doKerberos
+
     def getServerName(self):
         return self._Session['ServerName']
+
+    def getClientName(self):
+        return self._Session['ClientName']
+
+    def getRemoteName(self):
+        if self._Session['ServerName'] == '':
+            return self._Connection['ServerName']
+        return self._Session['ServerName']
+
+    def setRemoteName(self, name):
+        self._Session['ServerName'] = name
+        return True
 
     def getServerIP(self):
         return self._Connection['ServerIP']
@@ -279,7 +307,6 @@ class SMB3:
 
     def getDialect(self):
         return self._Connection['Dialect']
-
 
     def signSMB(self, packet):
         packet['Signature'] = '\x00'*16
@@ -338,7 +365,7 @@ class SMB3:
                 AES.MODE_CCM
             except:
                 LOG.critical("Your pycrypto doesn't support AES.MODE_CCM. Currently only pycrypto experimental supports this mode.\nDownload it from https://www.dlitz.net/software/pycrypto ")
-                raise 
+                raise
             cipher = AES.new(self._Session['EncryptionKey'], AES.MODE_CCM,  transformHeader['Nonce'])
             cipher.update(str(transformHeader)[20:])
             cipherText = cipher.encrypt(plainText)
@@ -399,72 +426,80 @@ class SMB3:
                 status = packet['Status']
 
         if packet['MessageID'] == packetID or packetID is None:
-        #    if self._Session['SigningRequired'] is True:
-        #        self.signSMB(packet)
             # Let's update the sequenceWindow based on the CreditsCharged
-            self._Connection['SequenceWindow'] += (packet['CreditCharge'] - 1)
+            # In the SMB 2.0.2 dialect, this field MUST NOT be used and MUST be reserved.
+            # The sender MUST set this to 0, and the receiver MUST ignore it.
+            # In all other dialects, this field indicates the number of credits that this request consumes.
+            if self._Connection['Dialect'] > SMB2_DIALECT_002:
+                self._Connection['SequenceWindow'] += (packet['CreditCharge'] - 1)
             return packet
         else:
             self._Connection['OutstandingResponses'][packet['MessageID']] = packet
             return self.recvSMB(packetID) 
 
-    def negotiateSession(self, preferredDialect = None):
-        packet = self.SMB_PACKET()
-        packet['Command'] = SMB2_NEGOTIATE
-        negSession = SMB2Negotiate()
-
-        negSession['SecurityMode'] = SMB2_NEGOTIATE_SIGNING_ENABLED 
+    def negotiateSession(self, preferredDialect = None, negSessionResponse = None):
+        # Let's store some data for later use
+        self._Connection['ClientSecurityMode'] = SMB2_NEGOTIATE_SIGNING_ENABLED
         if self.RequireMessageSigning is True:
-            negSession['SecurityMode'] |= SMB2_NEGOTIATE_SIGNING_REQUIRED
-        negSession['Capabilities'] = SMB2_GLOBAL_CAP_ENCRYPTION
-        negSession['ClientGuid'] = self.ClientGuid
-        if preferredDialect is not None:
-            negSession['Dialects'] = [preferredDialect]
-        else:
-            negSession['Dialects'] = [SMB2_DIALECT_002, SMB2_DIALECT_21, SMB2_DIALECT_30]
-        negSession['DialectCount'] = len(negSession['Dialects'])
-        packet['Data'] = negSession
+            self._Connection['ClientSecurityMode'] |= SMB2_NEGOTIATE_SIGNING_REQUIRED
+        self._Connection['Capabilities'] = SMB2_GLOBAL_CAP_ENCRYPTION
+        currentDialect = SMB2_DIALECT_WILDCARD
 
-        # Storing this data for later use
-        self._Connection['ClientSecurityMode'] = negSession['SecurityMode']
-        self._Connection['Capabilities']       = negSession['Capabilities']
+        # Do we have a negSessionPacket already?
+        if negSessionResponse is not None:
+            # Yes, let's store the dialect answered back
+            negResp = SMB2Negotiate_Response(negSessionResponse['Data'])
+            currentDialect = negResp['DialectRevision']
 
-        packetID = self.sendSMB(packet)
-        ans = self.recvSMB(packetID)
-        if ans.isValidAnswer(STATUS_SUCCESS):
-             # ToDo this:
-             # If the DialectRevision in the SMB2 NEGOTIATE Response is 0x02FF, the client MUST issue a new
-             # SMB2 NEGOTIATE request as described in section 3.2.4.2.2.2 with the only exception 
-             # that the client MUST allocate sequence number 1 from Connection.SequenceWindow, and MUST set
-             # MessageId field of the SMB2 header to 1. Otherwise, the client MUST proceed as follows.
-            negResp = SMB2Negotiate_Response(ans['Data'])
-            self._Connection['MaxTransactSize']   = min(0x100000,negResp['MaxTransactSize'])
-            self._Connection['MaxReadSize']       = min(0x100000,negResp['MaxReadSize'])
-            self._Connection['MaxWriteSize']      = min(0x100000,negResp['MaxWriteSize'])
-            self._Connection['ServerGuid']        = negResp['ServerGuid']
-            self._Connection['GSSNegotiateToken'] = negResp['Buffer']
-            self._Connection['Dialect']           = negResp['DialectRevision']
-            if (negResp['SecurityMode'] & SMB2_NEGOTIATE_SIGNING_REQUIRED) == SMB2_NEGOTIATE_SIGNING_REQUIRED:
-                self._Connection['RequireSigning'] = True
-            if (negResp['Capabilities'] & SMB2_GLOBAL_CAP_LEASING) == SMB2_GLOBAL_CAP_LEASING: 
-                self._Connection['SupportsFileLeasing'] = True
-            if (negResp['Capabilities'] & SMB2_GLOBAL_CAP_LARGE_MTU) == SMB2_GLOBAL_CAP_LARGE_MTU:
-                self._Connection['SupportsMultiCredit'] = True
+        if currentDialect == SMB2_DIALECT_WILDCARD:
+            # Still don't know the chosen dialect, let's send our options
 
-            if self._Connection['Dialect'] == SMB2_DIALECT_30:
-                # Switching to the right packet format
-                self.SMB_PACKET = SMB3Packet
-                if (negResp['Capabilities'] & SMB2_GLOBAL_CAP_DIRECTORY_LEASING) == SMB2_GLOBAL_CAP_DIRECTORY_LEASING:
-                    self._Connection['SupportsDirectoryLeasing'] = True
-                if (negResp['Capabilities'] & SMB2_GLOBAL_CAP_MULTI_CHANNEL) == SMB2_GLOBAL_CAP_MULTI_CHANNEL:
-                    self._Connection['SupportsMultiChannel'] = True
-                if (negResp['Capabilities'] & SMB2_GLOBAL_CAP_PERSISTENT_HANDLES) == SMB2_GLOBAL_CAP_PERSISTENT_HANDLES:
-                    self._Connection['SupportsPersistentHandles'] = True
-                if (negResp['Capabilities'] & SMB2_GLOBAL_CAP_ENCRYPTION) == SMB2_GLOBAL_CAP_ENCRYPTION:
-                    self._Connection['SupportsEncryption'] = True
+            packet = self.SMB_PACKET()
+            packet['Command'] = SMB2_NEGOTIATE
+            negSession = SMB2Negotiate()
 
-                self._Connection['ServerCapabilities'] = negResp['Capabilities']
-                self._Connection['ServerSecurityMode'] = negResp['SecurityMode']
+            negSession['SecurityMode'] = self._Connection['ClientSecurityMode']
+            negSession['Capabilities'] = self._Connection['Capabilities']
+            negSession['ClientGuid'] = self.ClientGuid
+            if preferredDialect is not None:
+                negSession['Dialects'] = [preferredDialect]
+            else:
+                negSession['Dialects'] = [SMB2_DIALECT_002, SMB2_DIALECT_21, SMB2_DIALECT_30]
+            negSession['DialectCount'] = len(negSession['Dialects'])
+            packet['Data'] = negSession
+
+            packetID = self.sendSMB(packet)
+            ans = self.recvSMB(packetID)
+            if ans.isValidAnswer(STATUS_SUCCESS):
+                negResp = SMB2Negotiate_Response(ans['Data'])
+
+        self._Connection['MaxTransactSize']   = min(0x100000,negResp['MaxTransactSize'])
+        self._Connection['MaxReadSize']       = min(0x100000,negResp['MaxReadSize'])
+        self._Connection['MaxWriteSize']      = min(0x100000,negResp['MaxWriteSize'])
+        self._Connection['ServerGuid']        = negResp['ServerGuid']
+        self._Connection['GSSNegotiateToken'] = negResp['Buffer']
+        self._Connection['Dialect']           = negResp['DialectRevision']
+        if (negResp['SecurityMode'] & SMB2_NEGOTIATE_SIGNING_REQUIRED) == SMB2_NEGOTIATE_SIGNING_REQUIRED:
+            self._Connection['RequireSigning'] = True
+        if (negResp['Capabilities'] & SMB2_GLOBAL_CAP_LEASING) == SMB2_GLOBAL_CAP_LEASING:
+            self._Connection['SupportsFileLeasing'] = True
+        if (negResp['Capabilities'] & SMB2_GLOBAL_CAP_LARGE_MTU) == SMB2_GLOBAL_CAP_LARGE_MTU:
+            self._Connection['SupportsMultiCredit'] = True
+
+        if self._Connection['Dialect'] == SMB2_DIALECT_30:
+            # Switching to the right packet format
+            self.SMB_PACKET = SMB3Packet
+            if (negResp['Capabilities'] & SMB2_GLOBAL_CAP_DIRECTORY_LEASING) == SMB2_GLOBAL_CAP_DIRECTORY_LEASING:
+                self._Connection['SupportsDirectoryLeasing'] = True
+            if (negResp['Capabilities'] & SMB2_GLOBAL_CAP_MULTI_CHANNEL) == SMB2_GLOBAL_CAP_MULTI_CHANNEL:
+                self._Connection['SupportsMultiChannel'] = True
+            if (negResp['Capabilities'] & SMB2_GLOBAL_CAP_PERSISTENT_HANDLES) == SMB2_GLOBAL_CAP_PERSISTENT_HANDLES:
+                self._Connection['SupportsPersistentHandles'] = True
+            if (negResp['Capabilities'] & SMB2_GLOBAL_CAP_ENCRYPTION) == SMB2_GLOBAL_CAP_ENCRYPTION:
+                self._Connection['SupportsEncryption'] = True
+
+            self._Connection['ServerCapabilities'] = negResp['Capabilities']
+            self._Connection['ServerSecurityMode'] = negResp['SecurityMode']
 
     def getCredentials(self):
         return (
@@ -501,6 +536,7 @@ class SMB3:
         self.__aesKey   = aesKey
         self.__TGT      = TGT
         self.__TGS      = TGS
+        self._doKerberos= True
        
         sessionSetup = SMB2SessionSetup()
         if self.RequireMessageSigning is True:
@@ -591,11 +627,12 @@ class SMB3:
         # (Section 5.5.1)
         encryptedEncodedAuthenticator = cipher.encrypt(sessionKey, 11, encodedAuthenticator, None)
 
-        apReq['authenticator'] = None
+        apReq['authenticator'] = noValue
         apReq['authenticator']['etype'] = cipher.enctype
         apReq['authenticator']['cipher'] = encryptedEncodedAuthenticator
 
-        blob['MechToken'] = encoder.encode(apReq)
+        blob['MechToken'] = struct.pack('B', ASN1_AID) + asn1encode( struct.pack('B', ASN1_OID) + asn1encode(
+            TypesMech['KRB5 - Kerberos 5'] ) + KRB5_AP_REQ + encoder.encode(apReq))
 
         sessionSetup['SecurityBufferLength'] = len(blob)
         sessionSetup['Buffer']               = blob.getData()
@@ -620,6 +657,14 @@ class SMB3:
             if self._Session['SigningRequired'] is True:
                 self._Session['SigningActivated'] = True
             if self._Connection['Dialect'] == SMB2_DIALECT_30:
+                # SMB 3.0. Encryption should be available. Let's enforce it if we have AES CCM available
+                from Crypto.Cipher import AES
+                try:
+                    AES.MODE_CCM
+                    self._Session['SessionFlags'] |= SMB2_SESSION_FLAG_ENCRYPT_DATA
+                except:
+                    LOG.debug(
+                        "Your pycrypto doesn't support AES.MODE_CCM. Currently only pycrypto experimental supports this mode.\nDownload it from https://www.dlitz.net/software/pycrypto")
                 self._Session['ApplicationKey']  = crypto.KDF_CounterMode(self._Session['SessionKey'], "SMB2APP\x00", "SmbRpc\x00", 128)
                 self._Session['EncryptionKey']   = crypto.KDF_CounterMode(self._Session['SessionKey'], "SMB2AESCCM\x00", "ServerIn \x00", 128)
                 self._Session['DecryptionKey']   = crypto.KDF_CounterMode(self._Session['SessionKey'], "SMB2AESCCM\x00", "ServerOut\x00", 128)
@@ -674,7 +719,7 @@ class SMB3:
 
         # NTLMSSP
         blob['MechTypes'] = [TypesMech['NTLMSSP - Microsoft NTLM Security Support Provider']]
-        auth = ntlm.getNTLMSSPType1('',domain, self._Connection['RequireSigning'])
+        auth = ntlm.getNTLMSSPType1(self._Connection['ClientName'],domain, self._Connection['RequireSigning'])
         blob['MechToken'] = str(auth)
 
         sessionSetup['SecurityBufferLength'] = len(blob)
@@ -761,6 +806,13 @@ class SMB3:
                     if self._Session['SigningRequired'] is True:
                         self._Session['SigningActivated'] = True
                     if self._Connection['Dialect'] == SMB2_DIALECT_30:
+                        # SMB 3.0. Encryption should be available. Let's enforce it if we have AES CCM available
+                        from Crypto.Cipher import AES
+                        try:
+                            AES.MODE_CCM
+                            self._Session['SessionFlags'] |= SMB2_SESSION_FLAG_ENCRYPT_DATA
+                        except:
+                            LOG.debug("Your pycrypto doesn't support AES.MODE_CCM. Currently only pycrypto experimental supports this mode.\nDownload it from https://www.dlitz.net/software/pycrypto")
                         self._Session['ApplicationKey']  = crypto.KDF_CounterMode(exportedSessionKey, "SMB2APP\x00", "SmbRpc\x00", 128)
                         self._Session['EncryptionKey']   = crypto.KDF_CounterMode(exportedSessionKey, "SMB2AESCCM\x00", "ServerIn \x00", 128)
                         self._Session['DecryptionKey']   = crypto.KDF_CounterMode(exportedSessionKey, "SMB2AESCCM\x00", "ServerOut\x00", 128)
@@ -859,6 +911,12 @@ class SMB3:
             shareName = self._Session['TreeConnectTable'][treeId]['ShareName']
             del(self._Session['TreeConnectTable'][shareName])
             del(self._Session['TreeConnectTable'][treeId])
+            filesIDToBeRemoved = []
+            for fileID in self._Session['OpenTable'].keys():
+                if self._Session['OpenTable'][fileID]['TreeConnect'] == treeId:
+                    filesIDToBeRemoved.append(fileID)
+            for fileIDToBeRemoved in filesIDToBeRemoved:
+                del(self._Session['OpenTable'][fileIDToBeRemoved])
             return True
 
     def create(self, treeId, fileName, desiredAccess, shareMode, creationOptions, creationDisposition, fileAttributes, impersonationLevel = SMB2_IL_IMPERSONATION, securityFlags = 0, oplockLevel = SMB2_OPLOCK_LEVEL_NONE, createContexts = None):
@@ -918,6 +976,8 @@ class SMB3:
 
         if createContexts is not None:
             smb2Create['Buffer'] += createContexts
+            smb2Create['CreateContextsOffset'] = len(SMB2Packet()) + SMB2Create.SIZE + smb2Create['NameLength']
+            smb2Create['CreateContextsLength'] = len(createContexts)
         else:
             smb2Create['CreateContextsOffset'] = 0
             smb2Create['CreateContextsLength'] = 0
@@ -1424,7 +1484,14 @@ class SMB3:
 
         fileId = None
         try:
-            fileId = self.create(treeId, pathName, DELETE, FILE_SHARE_DELETE, FILE_DIRECTORY_FILE | FILE_DELETE_ON_CLOSE, FILE_OPEN, 0)
+            fileId = self.create(treeId, pathName, desiredAccess=DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                                 shareMode=FILE_SHARE_DELETE | FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                 creationOptions=FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT,
+                                 creationDisposition=FILE_OPEN, fileAttributes=0)
+            from impacket import smb
+            delete_req = smb.SMBSetFileDispositionInfo()
+            delete_req['DeletePending'] = True
+            self.setInfo(treeId, fileId, inputBlob=delete_req, fileInfoClass=SMB2_FILE_DISPOSITION_INFO)
         finally:
             if fileId is not None:
                 self.close(treeId, fileId)
@@ -1474,7 +1541,7 @@ class SMB3:
             else:
                 written = 0
                 toBeRead = fileSize-offset
-                while written < (toBeRead):
+                while written < toBeRead:
                     data = self.read(treeId, fileId, offset, self._Connection['MaxReadSize'])
                     written += len(data)
                     offset  += len(data)
@@ -1523,7 +1590,12 @@ class SMB3:
 
         return self.ioctl(treeId, None, FSCTL_PIPE_WAIT,flags=SMB2_0_IOCTL_IS_FSCTL, inputBlob=pipeWait, maxInputResponse = 0, maxOutputResponse=0)
         
+    def getIOCapabilities(self):
+        res = dict()
 
+        res['MaxReadSize'] = self._Connection['MaxReadSize']
+        res['MaxWriteSize'] = self._Connection['MaxWriteSize']
+        return res
         
 
     ######################################################################
@@ -1531,9 +1603,11 @@ class SMB3:
     # NOTE: It is strongly recommended not to use these commands
     # when implementing new client calls.
     get_server_name            = getServerName
+    get_client_name            = getClientName
     get_server_domain          = getServerDomain
     get_server_dns_domain_name = getServerDNSDomainName
-    get_remote_name            = getServerName
+    get_remote_name            = getRemoteName
+    set_remote_name            = setRemoteName
     get_remote_host            = getServerIP
     get_server_os              = getServerOS
     get_server_os_major        = getServerOSMajor
@@ -1549,10 +1623,10 @@ class SMB3:
     retr_file                  = retrieveFile
     list_path                  = listPath
 
-    def __del__(self):
+    def close_session(self):
         if self._NetBIOSSession:
             self._NetBIOSSession.close()
-
+            self._NetBIOSSession = None
 
     def doesSupportNTLMv2(self):
         # Always true :P 

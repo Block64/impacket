@@ -1,4 +1,4 @@
-# Copyright (c) 2003-2015 CORE Security Technologies
+# Copyright (c) 2003-2016 CORE Security Technologies
 #
 # This software is provided under under a slightly modified version
 # of the Apache Software License. See the accompanying LICENSE file
@@ -26,8 +26,9 @@
 #    not used, returning RPC_E_DISCONNECTED
 #
 
+import socket
 from struct import pack
-from threading import Timer
+from threading import Timer, currentThread
 
 from impacket.dcerpc.v5.ndr import NDRCALL, NDRSTRUCT, NDRPOINTER, NDRUniConformantArray, NDRTLSTRUCT, UNKNOWNDATA
 from impacket.dcerpc.v5.dtypes import LPWSTR, ULONGLONG, HRESULT, GUID, USHORT, WSTR, DWORD, LPLONG, LONG, PGUID, ULONG, \
@@ -71,7 +72,7 @@ class DCERPCSessionError(DCERPCException):
     def __str__( self ):
         if hresult_errors.ERROR_MESSAGES.has_key(self.error_code):
             error_msg_short = hresult_errors.ERROR_MESSAGES[self.error_code][0]
-            error_msg_verbose = hresult_errors.ERROR_MESSAGES[self.error_code][1] 
+            error_msg_verbose = hresult_errors.ERROR_MESSAGES[self.error_code][1]
             return 'DCOM SessionError: code: 0x%x - %s - %s' % (self.error_code, error_msg_short, error_msg_verbose)
         else:
             return 'DCOM SessionError: unknown error code: 0x%x' % self.error_code
@@ -943,7 +944,7 @@ class DCOMConnection:
     PORTMAPS = {}
 
     def __init__(self, target, username='', password='', domain='', lmhash='', nthash='', aesKey='', TGT=None, TGS=None,
-                 authLevel=RPC_C_AUTHN_LEVEL_PKT_PRIVACY, oxidResolver=False, doKerberos=False):
+                 authLevel=RPC_C_AUTHN_LEVEL_PKT_PRIVACY, oxidResolver=False, doKerberos=False, kdcHost=None):
         self.__target = target
         self.__userName = username
         self.__password = password
@@ -957,6 +958,7 @@ class DCOMConnection:
         self.__portmap = None
         self.__oxidResolver = oxidResolver
         self.__doKerberos = doKerberos
+        self.__kdcHost = kdcHost
         self.initConnection()
 
     @classmethod
@@ -992,7 +994,7 @@ class DCOMConnection:
                 if DCOMConnection.OID_ADD.has_key(target):
                     addedOids = DCOMConnection.OID_ADD[target]
                     del(DCOMConnection.OID_ADD[target])
-            
+
                 if DCOMConnection.OID_DEL.has_key(target):
                     deletedOids = DCOMConnection.OID_DEL[target]
                     del(DCOMConnection.OID_DEL[target])
@@ -1001,7 +1003,7 @@ class DCOMConnection:
 
                 if len(addedOids) > 0 or len(deletedOids) > 0:
                     if DCOMConnection.OID_SET[target].has_key('setid'):
-                        setId = DCOMConnection.OID_SET[target]['setid'] 
+                        setId = DCOMConnection.OID_SET[target]['setid']
                     else:
                         setId = 0
                     resp = objExporter.ComplexPing(setId, 0, addedOids, deletedOids)
@@ -1015,7 +1017,7 @@ class DCOMConnection:
             # We should try to continue tho.
             LOG.error(str(e))
             pass
-            
+
         DCOMConnection.PINGTIMER = Timer(120,DCOMConnection.pingServer)
         try:
             DCOMConnection.PINGTIMER.start()
@@ -1041,6 +1043,7 @@ class DCOMConnection:
             # This method exists only for selected protocol sequences.
             rpctransport.set_credentials(self.__userName, self.__password, self.__domain, self.__lmhash, self.__nthash,
                                          self.__aesKey, self.__TGT, self.__TGS)
+            rpctransport.set_kerberos(self.__doKerberos, self.__kdcHost)
         self.__portmap = rpctransport.get_dce_rpc()
         self.__portmap.set_auth_level(self.__authLevel)
         if self.__doKerberos is True:
@@ -1067,7 +1070,7 @@ class DCOMConnection:
                 DCOMConnection.PINGTIMER.join()
                 DCOMConnection.PINGTIMER = None
         if INTERFACE.CONNECTIONS.has_key(self.__target):
-            INTERFACE.CONNECTIONS[self.__target] = {}
+            del(INTERFACE.CONNECTIONS[self.__target][currentThread().getName()])
         self.__portmap.disconnect()
         #print INTERFACE.CONNECTIONS
 
@@ -1123,6 +1126,7 @@ class INTERFACE:
             # We gotta check if we have a container inside our connection list, if not, create
             if INTERFACE.CONNECTIONS.has_key(self.__target) is not True:
                 INTERFACE.CONNECTIONS[self.__target] = {}
+                INTERFACE.CONNECTIONS[self.__target][currentThread().getName()] = {}
 
             if objRef is not None:
                 self.process_interface(objRef)
@@ -1182,7 +1186,7 @@ class INTERFACE:
         return self.__ipidRemUnknown
 
     def get_dce_rpc(self):
-        return INTERFACE.CONNECTIONS[self.__target][self.__oxid]['dce']
+        return INTERFACE.CONNECTIONS[self.__target][currentThread().getName()][self.__oxid]['dce']
 
     def get_cinstance(self):
         return self.__cinstance
@@ -1190,22 +1194,43 @@ class INTERFACE:
     def set_cinstance(self, cinstance):
         self.__cinstance = cinstance
 
+    def is_fdqn(self):
+        # I will assume the following
+        # If I can't socket.inet_aton() then it's not an IPv4 address
+        # Same for ipv6, but since socket.inet_pton is not available in Windows, I'll look for ':'. There can't be
+        # an FQDN with ':'
+        # Is it isn't both, then it is a FDQN
+        try:
+            socket.inet_aton(self.__target)
+        except:
+            # Not an IPv4
+            try:
+                self.__target.index(':')
+            except:
+                # Not an IPv6, it's a FDQN
+                return True
+        return False
+
+
     def connect(self, iid = None):
         if INTERFACE.CONNECTIONS.has_key(self.__target) is True:
-            if INTERFACE.CONNECTIONS[self.__target].has_key(self.__oxid) is True:
-                dce = INTERFACE.CONNECTIONS[self.__target][self.__oxid]['dce']
-                currentBinding = INTERFACE.CONNECTIONS[self.__target][self.__oxid]['currentBinding']
+            if INTERFACE.CONNECTIONS[self.__target].has_key(currentThread().getName()) and \
+                            INTERFACE.CONNECTIONS[self.__target][currentThread().getName()].has_key(self.__oxid) is True:
+                dce = INTERFACE.CONNECTIONS[self.__target][currentThread().getName()][self.__oxid]['dce']
+                currentBinding = INTERFACE.CONNECTIONS[self.__target][currentThread().getName()][self.__oxid]['currentBinding']
                 if currentBinding == iid:
                     # We don't need to alter_ctx
                     pass
                 else:
                     newDce = dce.alter_ctx(iid)
-                    INTERFACE.CONNECTIONS[self.__target][self.__oxid]['dce'] = newDce
-                    INTERFACE.CONNECTIONS[self.__target][self.__oxid]['currentBinding'] = iid
+                    INTERFACE.CONNECTIONS[self.__target][currentThread().getName()][self.__oxid]['dce'] = newDce
+                    INTERFACE.CONNECTIONS[self.__target][currentThread().getName()][self.__oxid]['currentBinding'] = iid
             else:
                 stringBindings = self.get_cinstance().get_string_bindings()
                 # No OXID present, we should create a new connection and store it
                 stringBinding = None
+                isTargetFDQN = self.is_fdqn()
+                LOG.debug('Target system is %s and isFDQN is %s' % (self.get_target(), isTargetFDQN))
                 for strBinding in stringBindings:
                     # Here, depending on the get_target() value several things can happen
                     # 1) it's an IPv4 address
@@ -1227,7 +1252,7 @@ class INTERFACE:
                             stringBinding = 'ncacn_ip_tcp:' + strBinding['aNetworkAddr'][:-1]
                             break
                         # If get_target() is a FQDN, does it match the hostname?
-                        elif binding.upper().find(self.get_target().upper().partition('.')[0]) >= 0:
+                        elif isTargetFDQN and binding.upper().find(self.get_target().upper().partition('.')[0]) >= 0:
                             # Here we replace the aNetworkAddr with self.get_target()
                             # This is to help resolving the target system name.
                             # self.get_target() has been resolved already otherwise we wouldn't be here whereas
@@ -1237,10 +1262,16 @@ class INTERFACE:
                             break
 
                 LOG.debug('StringBinding chosen: %s' % stringBinding)
+                if stringBinding is None:
+                    # Something wen't wrong, let's just report it
+                    raise Exception('Can\'t find a valid stringBinding to connect')
+
                 dcomInterface = transport.DCERPCTransportFactory(stringBinding)
                 if hasattr(dcomInterface, 'set_credentials'):
                     # This method exists only for selected protocol sequences.
                     dcomInterface.set_credentials(*DCOMConnection.PORTMAPS[self.__target].get_credentials())
+                    dcomInterface.set_kerberos(DCOMConnection.PORTMAPS[self.__target].get_rpc_transport().get_kerberos(),
+                                               DCOMConnection.PORTMAPS[self.__target].get_rpc_transport().get_kdcHost())
                 dcomInterface.set_connect_timeout(300)
                 dce = dcomInterface.get_dce_rpc()
 
@@ -1262,9 +1293,10 @@ class INTERFACE:
                     LOG.critical("OXID NONE, something wrong!!!")
                     raise
 
-                INTERFACE.CONNECTIONS[self.__target][self.__oxid] = {}
-                INTERFACE.CONNECTIONS[self.__target][self.__oxid]['dce'] = dce
-                INTERFACE.CONNECTIONS[self.__target][self.__oxid]['currentBinding'] = iid
+                INTERFACE.CONNECTIONS[self.__target][currentThread().getName()] = {}
+                INTERFACE.CONNECTIONS[self.__target][currentThread().getName()][self.__oxid] = {}
+                INTERFACE.CONNECTIONS[self.__target][currentThread().getName()][self.__oxid]['dce'] = dce
+                INTERFACE.CONNECTIONS[self.__target][currentThread().getName()][self.__oxid]['currentBinding'] = iid
         else:
             # No connection created
             raise
@@ -1283,11 +1315,11 @@ class INTERFACE:
                 msg += "You should exit the app and start again\n"
                 raise DCERPCException(msg)
             else:
-                raise 
+                raise
         return resp
 
     def disconnect(self):
-        return INTERFACE.CONNECTIONS[self.__target][self.__oxid]['dce'].disconnect()
+        return INTERFACE.CONNECTIONS[self.__target][currentThread().getName()][self.__oxid]['dce'].disconnect()
 
 
 # 3.1.1.5.6.1 IRemUnknown Methods
@@ -1311,7 +1343,7 @@ class IRemUnknown(INTERFACE):
             _iid = IID()
             _iid['Data'] = iid
             request['iids'].append(_iid)
-        resp = self.request(request, IID_IRemUnknown, self.get_ipidRemUnknown())         
+        resp = self.request(request, IID_IRemUnknown, self.get_ipidRemUnknown())
         #resp.dump()
 
         return IRemUnknown2(
@@ -1328,8 +1360,8 @@ class IRemUnknown(INTERFACE):
         element['ipid'] = self.get_iPid()
         element['cPublicRefs'] = 1
         request['InterfaceRefs'].append(element)
-        resp = self.request(request, IID_IRemUnknown, self.get_ipidRemUnknown())         
-        return resp 
+        resp = self.request(request, IID_IRemUnknown, self.get_ipidRemUnknown())
+        return resp
 
     def RemRelease(self):
         request = RemRelease()
@@ -1340,9 +1372,9 @@ class IRemUnknown(INTERFACE):
         element['ipid'] = self.get_iPid()
         element['cPublicRefs'] = 1
         request['InterfaceRefs'].append(element)
-        resp = self.request(request, IID_IRemUnknown, self.get_ipidRemUnknown())         
+        resp = self.request(request, IID_IRemUnknown, self.get_ipidRemUnknown())
         DCOMConnection.delOid(self.get_target(), self.get_oid())
-        return resp 
+        return resp
 
 # 3.1.1.5.7 IRemUnknown2 Interface
 class IRemUnknown2(IRemUnknown):
@@ -1379,7 +1411,7 @@ class IObjectExporter:
                 strBindings = strBindings[len(binding):]
 
         return stringBindings
-    
+
     # 3.1.2.5.1.2 IObjectExporter::SimplePing (Opnum 1)
     def SimplePing(self, setId):
         self.__portmap.connect()
@@ -1388,7 +1420,7 @@ class IObjectExporter:
         request['pSetId'] = setId
         resp = self.__portmap.request(request)
         return resp
-    
+
     # 3.1.2.5.1.3 IObjectExporter::ComplexPing (Opnum 2)
     def ComplexPing(self, setId = 0, sequenceNum = 0, addToSet = [], delFromSet = []):
         self.__portmap.connect()
@@ -1416,7 +1448,7 @@ class IObjectExporter:
             request['DelFromSet'] = NULL
         resp = self.__portmap.request(request)
         return resp
-    
+
     # 3.1.2.5.1.4 IObjectExporter::ServerAlive (Opnum 3)
     def ServerAlive(self):
         self.__portmap.connect()
@@ -1533,7 +1565,7 @@ class IActivation:
 
         classInstance = CLASS_INSTANCE(ORPCthis, stringBindings)
         return IRemUnknown2(INTERFACE(classInstance, ''.join(resp['ppInterfaceData'][0]['abData']), ipidRemUnknown,
-                                      target=self.__portmap.get_rpc_transport().get_dip()))
+                                      target=self.__portmap.get_rpc_transport().getRemoteHost()))
 
 
 # 3.1.2.5.2.2 IRemoteSCMActivator Methods
@@ -1701,7 +1733,7 @@ class IRemoteSCMActivator:
         classInstance.set_auth_level(scmr['remoteReply']['authnHint'])
         classInstance.set_auth_type(self.__portmap.get_auth_type())
         return IRemUnknown2(INTERFACE(classInstance, ''.join(propsOut['ppIntfData'][0]['abData']), ipidRemUnknown,
-                                      target=self.__portmap.get_rpc_transport().get_dip()))
+                                      target=self.__portmap.get_rpc_transport().getRemoteHost()))
 
     def RemoteCreateInstance(self, clsId, iid):
         # Only supports one interface at a time
@@ -1867,4 +1899,4 @@ class IRemoteSCMActivator:
         classInstance.set_auth_level(scmr['remoteReply']['authnHint'])
         classInstance.set_auth_type(self.__portmap.get_auth_type())
         return IRemUnknown2(INTERFACE(classInstance, ''.join(propsOut['ppIntfData'][0]['abData']), ipidRemUnknown,
-                                      target=self.__portmap.get_rpc_transport().get_dip()))
+                                      target=self.__portmap.get_rpc_transport().getRemoteHost()))
