@@ -29,6 +29,7 @@ import logging
 import ntpath
 import socket
 import json
+import chardet
 
 from contextlib import closing
 from impacket.examples import logger
@@ -240,7 +241,12 @@ class RemoteShell(cmd.Cmd):
     def get_output(self):
         def output_callback(data):
             try:
-                self.__outputBuffer += data.decode(CODEC)
+                try:
+                    encoding = chardet.detect(data)
+                    encoding = encoding['encoding']
+                except Exception as e:
+                    encoding = CODEC
+                self.__outputBuffer += data.decode(encoding)
             except UnicodeDecodeError:
                 logging.error('Decoding error detected, consider running chcp.com at the target,\nmap the result with '
                               'https://docs.python.org/2.4/lib/standard-encodings.html\nand then execute wmiexec.py '
