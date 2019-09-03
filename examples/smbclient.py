@@ -19,10 +19,16 @@ from __future__ import print_function
 import sys
 import logging
 import argparse
+import socket
+import json
+
+from contextlib import closing
 from impacket.examples import logger
 from impacket.examples.smbclient import MiniImpacketShell
 from impacket import version
 from impacket.smbconnection import SMBConnection
+
+sys.stdout.reconfigure(encoding='utf-8')
 
 def main():
     # Init the example's logger theme
@@ -33,6 +39,7 @@ def main():
     parser.add_argument('target', action='store', help='[[domain/]username[:password]@]<targetName or address>')
     parser.add_argument('-file', type=argparse.FileType('r'), help='input file with commands to execute in the mini shell')
     parser.add_argument('-debug', action='store_true', help='Turn DEBUG output ON')
+    parser.add_argument('-cred', action='store', help='Encrypted target')
 
     group = parser.add_argument_group('authentication')
 
@@ -94,6 +101,31 @@ def main():
     else:
         lmhash = ''
         nthash = ''
+
+    if options.cred is not None:
+        HOST = '127.0.0.1'
+        PORT = 11000
+        CRED_STR = "CORE DECRYPT {0}\00".format(options.cred)
+        CRED_STR_E = CRED_STR.encode()
+
+        with closing(socket.socket()) as s:
+            s.connect((HOST, PORT))
+            s.sendall(CRED_STR_E)
+            ipc_result = s.recv(1024).decode('utf-8')
+
+        # cred = re.compile("(?:Content: )(.*)(?:, Arguments: .*)").search(ipc_result).group(1)
+        j = json.loads(ipc_result)
+        cred = j['MessageContent']
+
+        domain, username, password, address = re.compile('(?:(?:([^/@:]*)/)?([^@:]*)(?::([^@]*))?@)?(.*)').match(
+            cred).groups('')
+
+        # In case the password contains '@'
+        if '@' in address:
+            password = password + '@' + address.rpartition('@')[0]
+            address = address.rpartition('@')[2]
+        if domain is None:
+            domain = ''
 
     try:
         smbClient = SMBConnection(address, options.target_ip, sess_port=int(options.port))

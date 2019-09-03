@@ -20,13 +20,17 @@ import sys
 import argparse
 import logging
 import codecs
+import socket
+import json
 
+from contextlib import closing
 from impacket.examples import logger
 from impacket import version
 from impacket.dcerpc.v5 import transport, scmr
 from impacket.dcerpc.v5.ndr import NULL
 from impacket.crypto import encryptSecret
 
+sys.stdout.reconfigure(encoding='utf-8')
 
 class SVCCTL:
 
@@ -49,31 +53,32 @@ class SVCCTL:
     def run(self, remoteName, remoteHost):
 
         stringbinding = r'ncacn_np:%s[\pipe\svcctl]' % remoteName
-        logging.debug('StringBinding %s'%stringbinding)
+        logging.debug('StringBinding %s' % stringbinding)
         rpctransport = transport.DCERPCTransportFactory(stringbinding)
         rpctransport.set_dport(self.__port)
         rpctransport.setRemoteHost(remoteHost)
         if hasattr(rpctransport, 'set_credentials'):
             # This method exists only for selected protocol sequences.
-            rpctransport.set_credentials(self.__username, self.__password, self.__domain, self.__lmhash, self.__nthash, self.__aesKey)
+            rpctransport.set_credentials(self.__username, self.__password, self.__domain, self.__lmhash, self.__nthash,
+                                         self.__aesKey)
 
         rpctransport.set_kerberos(self.__doKerberos, self.__kdcHost)
         self.doStuff(rpctransport)
 
     def doStuff(self, rpctransport):
         dce = rpctransport.get_dce_rpc()
-        #dce.set_credentials(self.__username, self.__password)
+        # dce.set_credentials(self.__username, self.__password)
         dce.connect()
-        #dce.set_max_fragment_size(1)
-        #dce.set_auth_level(ntlm.NTLM_AUTH_PKT_PRIVACY)
-        #dce.set_auth_level(ntlm.NTLM_AUTH_PKT_INTEGRITY)
+        # dce.set_max_fragment_size(1)
+        # dce.set_auth_level(ntlm.NTLM_AUTH_PKT_PRIVACY)
+        # dce.set_auth_level(ntlm.NTLM_AUTH_PKT_INTEGRITY)
         dce.bind(scmr.MSRPC_UUID_SCMR)
-        #rpc = svcctl.DCERPCSvcCtl(dce)
+        # rpc = svcctl.DCERPCSvcCtl(dce)
         rpc = dce
         ans = scmr.hROpenSCManagerW(rpc)
         scManagerHandle = ans['lpScHandle']
         if self.__action != 'LIST' and self.__action != 'CREATE':
-            ans = scmr.hROpenServiceW(rpc, scManagerHandle, self.__options.name+'\x00')
+            ans = scmr.hROpenServiceW(rpc, scManagerHandle, self.__options.name + '\x00')
             serviceHandle = ans['lpServiceHandle']
 
         if self.__action == 'START':
@@ -140,46 +145,46 @@ class SVCCTL:
             print("%30s - " % self.__options.name, end=' ')
             state = resp['lpServiceStatus']['dwCurrentState']
             if state == scmr.SERVICE_CONTINUE_PENDING:
-               print("CONTINUE PENDING")
+                print("CONTINUE PENDING")
             elif state == scmr.SERVICE_PAUSE_PENDING:
-               print("PAUSE PENDING")
+                print("PAUSE PENDING")
             elif state == scmr.SERVICE_PAUSED:
-               print("PAUSED")
+                print("PAUSED")
             elif state == scmr.SERVICE_RUNNING:
-               print("RUNNING")
+                print("RUNNING")
             elif state == scmr.SERVICE_START_PENDING:
-               print("START PENDING")
+                print("START PENDING")
             elif state == scmr.SERVICE_STOP_PENDING:
-               print("STOP PENDING")
+                print("STOP PENDING")
             elif state == scmr.SERVICE_STOPPED:
-               print("STOPPED")
+                print("STOPPED")
             else:
-               print("UNKNOWN")
+                print("UNKNOWN")
         elif self.__action == 'LIST':
             logging.info("Listing services available on target")
-            #resp = rpc.EnumServicesStatusW(scManagerHandle, svcctl.SERVICE_WIN32_SHARE_PROCESS )
-            #resp = rpc.EnumServicesStatusW(scManagerHandle, svcctl.SERVICE_WIN32_OWN_PROCESS )
-            #resp = rpc.EnumServicesStatusW(scManagerHandle, serviceType = svcctl.SERVICE_FILE_SYSTEM_DRIVER, serviceState = svcctl.SERVICE_STATE_ALL )
+            # resp = rpc.EnumServicesStatusW(scManagerHandle, svcctl.SERVICE_WIN32_SHARE_PROCESS )
+            # resp = rpc.EnumServicesStatusW(scManagerHandle, svcctl.SERVICE_WIN32_OWN_PROCESS )
+            # resp = rpc.EnumServicesStatusW(scManagerHandle, serviceType = svcctl.SERVICE_FILE_SYSTEM_DRIVER, serviceState = svcctl.SERVICE_STATE_ALL )
             resp = scmr.hREnumServicesStatusW(rpc, scManagerHandle)
             for i in range(len(resp)):
                 print("%30s - %70s - " % (resp[i]['lpServiceName'][:-1], resp[i]['lpDisplayName'][:-1]), end=' ')
                 state = resp[i]['ServiceStatus']['dwCurrentState']
                 if state == scmr.SERVICE_CONTINUE_PENDING:
-                   print("CONTINUE PENDING")
+                    print("CONTINUE PENDING")
                 elif state == scmr.SERVICE_PAUSE_PENDING:
-                   print("PAUSE PENDING")
+                    print("PAUSE PENDING")
                 elif state == scmr.SERVICE_PAUSED:
-                   print("PAUSED")
+                    print("PAUSED")
                 elif state == scmr.SERVICE_RUNNING:
-                   print("RUNNING")
+                    print("RUNNING")
                 elif state == scmr.SERVICE_START_PENDING:
-                   print("START PENDING")
+                    print("START PENDING")
                 elif state == scmr.SERVICE_STOP_PENDING:
-                   print("STOP PENDING")
+                    print("STOP PENDING")
                 elif state == scmr.SERVICE_STOPPED:
-                   print("STOPPED")
+                    print("STOPPED")
                 else:
-                   print("UNKNOWN")
+                    print("UNKNOWN")
             print("Total Services: %d" % len(resp))
         elif self.__action == 'CREATE':
             logging.info("Creating service %s" % self.__options.name)
@@ -200,31 +205,30 @@ class SVCCTL:
                 display = self.__options.display + '\x00'
             else:
                 display = NULL
- 
+
             if self.__options.path is not None:
                 path = self.__options.path + '\x00'
             else:
                 path = NULL
- 
+
             if self.__options.start_name is not None:
                 start_name = self.__options.start_name + '\x00'
             else:
-                start_name = NULL 
+                start_name = NULL
 
             if self.__options.password is not None:
                 s = rpctransport.get_smb_connection()
                 key = s.getSessionKey()
                 try:
-                    password = (self.__options.password+'\x00').encode('utf-16le')
+                    password = (self.__options.password + '\x00').encode('utf-16le')
                 except UnicodeDecodeError:
                     import sys
-                    password = (self.__options.password+'\x00').decode(sys.getfilesystemencoding()).encode('utf-16le')
+                    password = (self.__options.password + '\x00').decode(sys.getfilesystemencoding()).encode('utf-16le')
                 password = encryptSecret(key, password)
             else:
                 password = NULL
- 
 
-            #resp = scmr.hRChangeServiceConfigW(rpc, serviceHandle,  display, path, service_type, start_type, start_name, password)
+            # resp = scmr.hRChangeServiceConfigW(rpc, serviceHandle,  display, path, service_type, start_type, start_name, password)
             scmr.hRChangeServiceConfigW(rpc, serviceHandle, service_type, start_type, scmr.SERVICE_ERROR_IGNORE, path,
                                         NULL, NULL, NULL, 0, start_name, password, 0, display)
             scmr.hRCloseServiceHandle(rpc, serviceHandle)
@@ -235,10 +239,11 @@ class SVCCTL:
 
         dce.disconnect()
 
-        return 
+        return
+
+    # Process command-line arguments.
 
 
-# Process command-line arguments.
 if __name__ == '__main__':
 
     # Init the example's logger theme
@@ -249,12 +254,13 @@ if __name__ == '__main__':
         sys.stdout = codecs.getwriter('utf8')(sys.stdout)
     print(version.BANNER)
 
-    parser = argparse.ArgumentParser(add_help = True, description = "Windows Service manipulation script.")
+    parser = argparse.ArgumentParser(add_help=True, description="Windows Service manipulation script.")
 
     parser.add_argument('target', action='store', help='[[domain/]username[:password]@]<targetName or address>')
     parser.add_argument('-debug', action='store_true', help='Turn DEBUG output ON')
+    parser.add_argument('-cred', action='store', help='Encrypted target')
     subparsers = parser.add_subparsers(help='actions', dest='action')
- 
+
     # A start command
     start_parser = subparsers.add_parser('start', help='starts the service')
     start_parser.add_argument('-name', action='store', required=True, help='service name')
@@ -292,31 +298,32 @@ if __name__ == '__main__':
     create_parser.add_argument('-service_type', action='store', required=False, help='service type')
     create_parser.add_argument('-start_type', action='store', required=False, help='service start type')
     create_parser.add_argument('-start_name', action='store', required=False, help='string that specifies the name of '
-                               'the account under which the service should run')
+                                                                                   'the account under which the service should run')
     create_parser.add_argument('-password', action='store', required=False, help='string that contains the password of '
-                               'the account whose name was specified by the start_name parameter')
+                                                                                 'the account whose name was specified by the start_name parameter')
 
     group = parser.add_argument_group('authentication')
 
-    group.add_argument('-hashes', action="store", metavar = "LMHASH:NTHASH", help='NTLM hashes, format is LMHASH:NTHASH')
+    group.add_argument('-hashes', action="store", metavar="LMHASH:NTHASH", help='NTLM hashes, format is LMHASH:NTHASH')
     group.add_argument('-no-pass', action="store_true", help='don\'t ask for password (useful for -k)')
-    group.add_argument('-k', action="store_true", help='Use Kerberos authentication. Grabs credentials from ccache file '
-                       '(KRB5CCNAME) based on target parameters. If valid credentials cannot be found, it will use the '
-                       'ones specified in the command line')
-    group.add_argument('-aesKey', action="store", metavar = "hex key", help='AES key to use for Kerberos Authentication '
-                                                                            '(128 or 256 bits)')
+    group.add_argument('-k', action="store_true",
+                       help='Use Kerberos authentication. Grabs credentials from ccache file '
+                            '(KRB5CCNAME) based on target parameters. If valid credentials cannot be found, it will use the '
+                            'ones specified in the command line')
+    group.add_argument('-aesKey', action="store", metavar="hex key", help='AES key to use for Kerberos Authentication '
+                                                                          '(128 or 256 bits)')
 
     group = parser.add_argument_group('connection')
 
-    group.add_argument('-dc-ip', action='store',metavar = "ip address", help='IP Address of the domain controller. If '
-                       'ommited it use the domain part (FQDN) specified in the target parameter')
+    group.add_argument('-dc-ip', action='store', metavar="ip address", help='IP Address of the domain controller. If '
+                                                                            'ommited it use the domain part (FQDN) specified in the target parameter')
     group.add_argument('-target-ip', action='store', metavar="ip address", help='IP Address of the target machine. If '
-                       'ommited it will use whatever was specified as target. This is useful when target is the NetBIOS '
-                       'name and you cannot resolve it')
+                                                                                'ommited it will use whatever was specified as target. This is useful when target is the NetBIOS '
+                                                                                'name and you cannot resolve it')
     group.add_argument('-port', choices=['139', '445'], nargs='?', default='445', metavar="destination port",
                        help='Destination port to connect to SMB Server')
- 
-    if len(sys.argv)==1:
+
+    if len(sys.argv) == 1:
         parser.print_help()
         sys.exit(1)
 
@@ -332,7 +339,7 @@ if __name__ == '__main__':
     domain, username, password, remoteName = re.compile('(?:(?:([^/@:]*)/)?([^@:]*)(?::([^@]*))?@)?(.*)').match(
         options.target).groups('')
 
-    #In case the password contains '@'
+    # In case the password contains '@'
     if '@' in remoteName:
         password = password + '@' + remoteName.rpartition('@')[0]
         remoteName = remoteName.rpartition('@')[2]
@@ -346,8 +353,34 @@ if __name__ == '__main__':
     if options.aesKey is not None:
         options.k = True
 
+        if options.cred is not None:
+            HOST = '127.0.0.1'
+            PORT = 11000
+            CRED_STR = "CORE DECRYPT {0}\00".format(options.cred)
+            CRED_STR_E = CRED_STR.encode()
+
+            with closing(socket.socket()) as s:
+                s.connect((HOST, PORT))
+                s.sendall(CRED_STR_E)
+                ipc_result = s.recv(1024).decode('utf-8')
+
+            # cred = re.compile("(?:Content: )(.*)(?:, Arguments: .*)").search(ipc_result).group(1)
+            j = json.loads(ipc_result)
+            cred = j['MessageContent']
+
+            domain, username, password, address = re.compile('(?:(?:([^/@:]*)/)?([^@:]*)(?::([^@]*))?@)?(.*)').match(
+                cred).groups('')
+
+            # In case the password contains '@'
+            if '@' in address:
+                password = password + '@' + address.rpartition('@')[0]
+                address = address.rpartition('@')[2]
+            if domain is None:
+                domain = ''
+
     if password == '' and username != '' and options.hashes is None and options.no_pass is False and options.aesKey is None:
         from getpass import getpass
+
         password = getpass("Password:")
 
     services = SVCCTL(username, password, domain, options, int(options.port))
@@ -356,5 +389,6 @@ if __name__ == '__main__':
     except Exception as e:
         if logging.getLogger().level == logging.DEBUG:
             import traceback
+
             traceback.print_exc()
         logging.error(str(e))
